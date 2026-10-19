@@ -148,6 +148,36 @@ def _post_register(
 # ---------------------------------------------------------------------------
 
 class AppHardeningTest(unittest.TestCase):
+
+    def test_verify_batch_success(self) -> None:
+        video_hash = "1" * 64
+        proof_id = "2" * 64
+        app_module.db.insert_proof_event(event_type="extract", video_hash=video_hash, proof_id=proof_id, tx_status="confirmed")
+        
+        response = self.client.post("/api/proofs/verify-batch", json={"proofs": [{"videoHash": video_hash}]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["results"][0]["status"], "verified")
+
+    def test_verify_batch_malformed(self) -> None:
+        response = self.client.post("/api/proofs/verify-batch", json={"proofs": [{"videoHash": "not hex"}]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["results"][0]["status"], "malformed")
+
+    def test_verify_batch_oversized(self) -> None:
+        proofs = [{"videoHash": "1" * 64} for _ in range(101)]
+        response = self.client.post("/api/proofs/verify-batch", json={"proofs": proofs})
+        self.assertEqual(response.status_code, 413)
+
+    def test_verify_batch_not_found(self) -> None:
+        response = self.client.post("/api/proofs/verify-batch", json={"proofs": [{"videoHash": "3" * 64}]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["results"][0]["status"], "not_found")
+        
+    def test_verify_batch_failed_dependency(self) -> None:
+        with patch("app.find_proof_events_by_video", side_effect=RuntimeError("db error")):
+            response = self.client.post("/api/proofs/verify-batch", json={"proofs": [{"videoHash": "1" * 64}]})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json["results"][0]["status"], "dependency_failure")
     def setUp(self) -> None:
         metrics_collector.reset()
         self.client = app_module.app.test_client()
@@ -1556,6 +1586,56 @@ class NormalizeOriginUnitTest(unittest.TestCase):
 
     def test_is_origin_allowed_wildcard_short_circuit(self) -> None:
         self.assertTrue(is_origin_allowed("https://any.example", ["*"]))
+
+
+class SchemaETagCachingTest(unittest.TestCase):
+    """ETag and caching headers for /api/schemas endpoints (issue #804)."""
+
+    def test_list_schemas_returns_200_with_etag(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get("/api/schemas")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers.get("ETag"))
+        self.assertIn("schemas", response.get_json())
+
+    def test_list_schemas_returns_304_on_matching_etag(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            first = client.get("/api/schemas")
+            etag = first.headers.get("ETag")
+            second = client.get("/api/schemas", headers={"If-None-Match": etag})
+        self.assertEqual(second.status_code, 304)
+
+    def test_get_schema_returns_404_for_unknown_hash(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get("/api/schemas/" + "0" * 64)
+        self.assertEqual(response.status_code, 404)
+
+    def test_get_schema_returns_200_with_cache_headers(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            first = client.get("/api/schemas")
+            schemas = first.get_json()["schemas"]
+            if not schemas:
+                self.skipTest("no schemas available")
+            h = schemas[0]["schemaHash"]
+            response = client.get(f"/api/schemas/{h}")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers.get("ETag"))
+        self.assertEqual(
+            response.headers.get("Cache-Control"),
+            "public, max-age=86400, immutable",
+        )
+
+    def test_get_schema_returns_304_on_matching_etag(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            first = client.get("/api/schemas")
+            schemas = first.get_json()["schemas"]
+            if not schemas:
+                self.skipTest("no schemas available")
+            h = schemas[0]["schemaHash"]
+            detail = client.get(f"/api/schemas/{h}")
+            etag = detail.headers.get("ETag")
+            second = client.get(f"/api/schemas/{h}", headers={"If-None-Match": etag})
+        self.assertEqual(second.status_code, 304)
 
 
 if __name__ == "__main__":

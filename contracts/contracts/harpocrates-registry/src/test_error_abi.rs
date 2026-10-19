@@ -140,6 +140,13 @@ fn canonical_name(err: RegistryError) -> &'static str {
         RegistryError::DuplicateLineage => "DuplicateLineage",
         RegistryError::LineageChildrenLimitExceeded => "LineageChildrenLimitExceeded",
         RegistryError::LineageChildrenSaturated => "LineageChildrenSaturated",
+        RegistryError::UnsupportedCircuitVersion => "UnsupportedCircuitVersion",
+        RegistryError::InvalidCircuitVersionRange => "InvalidCircuitVersionRange",
+        RegistryError::InvalidIssuerRotationGrace => "InvalidIssuerRotationGrace",
+        RegistryError::InvalidIssuerRotation => "InvalidIssuerRotation",
+        RegistryError::IssuerRotationNotFound => "IssuerRotationNotFound",
+        RegistryError::IssuerRotationGraceStillActive => "IssuerRotationGraceStillActive",
+        RegistryError::CircuitVersionMismatch => "CircuitVersionMismatch",
     }
 }
 
@@ -227,6 +234,13 @@ const ALL_VARIANTS: &[RegistryError] = &[
     RegistryError::DuplicateLineage,
     RegistryError::LineageChildrenLimitExceeded,
     RegistryError::LineageChildrenSaturated,
+    RegistryError::UnsupportedCircuitVersion,
+    RegistryError::InvalidCircuitVersionRange,
+    RegistryError::InvalidIssuerRotationGrace,
+    RegistryError::InvalidIssuerRotation,
+    RegistryError::IssuerRotationNotFound,
+    RegistryError::IssuerRotationGraceStillActive,
+    RegistryError::CircuitVersionMismatch,
 ];
 
 #[cfg(test)]
@@ -266,7 +280,10 @@ fn published_rows() -> Vec<AbiRow> {
 #[cfg(test)]
 #[test]
 fn abi_version_is_published() {
-    assert_eq!(ABI_VERSION, 1, "ABI version bumped without updating this suite");
+    assert_eq!(
+        ABI_VERSION, 1,
+        "ABI version bumped without updating this suite"
+    );
     assert!(
         ABI_DOC.contains("ABI version: 1"),
         "ERROR_ABI.md must publish the ABI version"
@@ -286,7 +303,8 @@ fn every_variant_is_published_exactly_once() {
         let row = &rows[index];
         let code = *variant as u32;
         assert_eq!(
-            row.code, code,
+            row.code,
+            code,
             "code {} drifted from RegistryError::{}",
             row.code,
             canonical_name(*variant)
@@ -359,7 +377,7 @@ fn retryable_codes_require_external_condition_only() {
             retryable.push(row.code);
         }
     }
-    let expected: &[u32] = &[21, 32, 41, 66];
+    let expected: &[u32] = &[21, 32, 41, 66, 86];
     assert_eq!(
         retryable.as_slice(),
         expected,
@@ -382,5 +400,8 @@ fn published_rows_carry_no_input_material() {
             );
         }
     }
-    assert!(!ABI_DOC.contains("-----BEGIN"), "ABI must not embed key material");
+    assert!(
+        !ABI_DOC.contains("-----BEGIN"),
+        "ABI must not embed key material"
+    );
 }

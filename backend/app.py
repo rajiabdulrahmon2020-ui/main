@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import functools
 import ipaddress
+import hashlib
 import json
 import logging
 import os
@@ -38,10 +39,14 @@ from errors import (
     FORBIDDEN,
     FORBIDDEN_ORIGIN,
     INTERNAL_ERROR,
+    MALFORMED_INPUT,
     NOT_FOUND,
+    OVERSIZED_INPUT,
     PAYLOAD_TOO_LARGE,
     RATE_LIMITED,
+    UNSUPPORTED_MEDIA_TYPE,
     VALIDATION_ERROR,
+    classify_cli_error,
     error_response,
 )
 from db import (
@@ -67,6 +72,12 @@ from db import (
     get_job,
     cancel_job,
 )
+from registration_reconcile import (
+    clamp_reconcile_limit,
+    default_min_confirmations,
+    reconcile_pending_registrations,
+    reconcile_registration,
+)
 from idempotency import idempotent
 from lineage import (
     LineageValidationError,
@@ -87,6 +98,7 @@ from metadata_errors import (
     metadata_error_response,
 )
 from schema import discover_schemas, resolve_schema, validate_selective_disclosure_input
+from verification_receipt import build_verification_receipt
 from stego import canonical_metadata_hash, embed_metadata, extract_metadata, sha256_file
 from c2pa import (
     C2paParseError,
@@ -110,10 +122,16 @@ from trace_fields import (
     format_traceparent,
     merge_trace_into_event,
 )
+from tracing import (
+    begin_request_span,
+    configure_tracing,
+    finish_request_span,
+)
 from readiness import ReadinessManager
+from verifier_cache import VerifierCache
 from admission import AdmissionController, require_capacity
 from webhook import WebhookWorker, queue_webhook_deliveries
-from quarantine import QuarantineError, isolate_upload
+from quarantine import QuarantineError, isolate_upload, sniff_media_type_stream, sniff_media_type_path
 from strkey import validate_source_address, validate_contract_id
 from streaming_upload import (
     StreamingFileStorage,
@@ -136,6 +154,32 @@ if not LOGGER.handlers:
     LOGGER.addHandler(handler)
 LOGGER.setLevel(logging.INFO)
 LOGGER.propagate = False
+
+# ---------------------------------------------------------------------------
+# Declared upload-body budget
+# ---------------------------------------------------------------------------
+# A ``multipart/form-data`` upload carries framing bytes (boundaries, part
+# headers, and the small metadata part) on top of the video/chunk payload, so
+# the declared ``Content-Length`` budget allows a fixed overhead on top of the
+# per-file budget.  Without this allowance a payload sitting exactly on
+# ``MAX_VIDEO_BYTES`` would be rejected purely because of framing.
+UPLOAD_MULTIPART_OVERHEAD_BYTES = 1_048_576
+
+
+def declared_upload_limit_bytes(config) -> int:
+    """Return the largest acceptable declared ``Content-Length`` for an upload.
+
+    The per-file budget is ``UPLOAD_MAX_BYTES`` when the deployment sets it,
+    otherwise ``MAX_VIDEO_BYTES``; multipart framing is permitted on top of it.
+    The whole body must still fit under ``MAX_CONTENT_LENGTH`` when that cap is
+    the lower of the two, so the effective limit is the minimum of the two.
+    """
+    per_file = int(getattr(config, "upload_max_bytes", 0) or config.max_video_bytes)
+    limit = per_file + UPLOAD_MULTIPART_OVERHEAD_BYTES
+    global_cap = int(getattr(config, "max_content_length", 0) or 0)
+    if global_cap and limit > global_cap:
+        limit = global_cap
+    return limit
 
 
 def _make_key_func(config):
@@ -183,7 +227,20 @@ def _make_key_func(config):
 def create_app() -> Flask:
     load_dotenv()
     config = load_config()
+    configure_tracing(
+        enabled=config.tracing_enabled,
+        service_name=config.tracing_service_name,
+        endpoint=config.tracing_endpoint,
+        sample_ratio=config.tracing_sample_ratio,
+        export_timeout_seconds=config.tracing_export_timeout_seconds,
+        service_version=config.release_id,
+    )
     app = Flask(__name__)
+    app.extensions["verifier_cache"] = VerifierCache(
+        max_size=config.verifier_cache_max_size,
+        positive_ttl_seconds=config.verifier_cache_positive_ttl_seconds,
+        negative_ttl_seconds=config.verifier_cache_negative_ttl_seconds,
+    )
     CORS(app, **cors_kwargs(config.cors_origins))
     app.config["MAX_CONTENT_LENGTH"] = config.max_content_length
     # Propagate the request id through every response (header + JSON body).
@@ -228,6 +285,28 @@ def create_app() -> Flask:
         g.start_time = time.perf_counter()
         g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
         g.request_started_at = time.perf_counter()
+
+    @app.before_request
+    def initialize_trace_context():
+        g.trace_fields = build_trace_fields(
+            request.headers,
+            request_id=g.request_id,
+            method=request.method,
+            route=request.url_rule.rule if request.url_rule else request.path,
+            path=request.path,
+        )
+        g.request_id = g.trace_fields["request_id"]
+        g.otel_request_span = begin_request_span(
+            request.headers,
+            method=request.method,
+            route=request.url_rule.rule if request.url_rule else g.trace_fields["endpoint_pattern"],
+            request_id=g.request_id,
+        )
+        span_context = g.otel_request_span.span.get_span_context()
+        if span_context.is_valid:
+            g.trace_fields["trace_id"] = f"{span_context.trace_id:032x}"
+            g.trace_fields["span_id"] = f"{span_context.span_id:016x}"
+            g.trace_fields["trace_flags"] = f"{int(span_context.trace_flags):02x}"
 
     @app.before_request
     def enforce_cors_origins():
@@ -275,17 +354,6 @@ def create_app() -> Flask:
             message="request origin is not allowed",
             status=403,
         )
-        # Privacy-safe trace fields for log correlation (no secrets/media/PII).
-        g.trace_fields = build_trace_fields(
-            request.headers,
-            request_id=g.request_id,
-            method=request.method,
-            route=request.url_rule.rule if request.url_rule else request.path,
-            path=request.path,
-        )
-        # Keep request_id aligned with normalized opaque ID from trace builder.
-        g.request_id = g.trace_fields["request_id"]
-
     @app.after_request
     def process_response(response: Response):
         # X-Request-ID and the body-level request_id are applied by the
@@ -337,7 +405,20 @@ def create_app() -> Flask:
                 trace,
             ),
         )
+        finish_request_span(
+            getattr(g, "otel_request_span", None),
+            status_code=response.status_code,
+        )
         return response
+
+    @app.teardown_request
+    def finish_unhandled_request_span(error: BaseException | None):
+        if getattr(g, "otel_request_span", None) is not None:
+            finish_request_span(
+                g.otel_request_span,
+                status_code=500 if error is not None else 200,
+                error=error,
+            )
 
     def require_register_auth(fn):
         """Decorator that enforces ownership-scoped auth on proof registration.
@@ -456,6 +537,7 @@ def create_app() -> Flask:
             code=PAYLOAD_TOO_LARGE,
             message="request body is too large",
             status=413,
+            cli_code=OVERSIZED_INPUT,
         )
 
     @app.errorhandler(ValueError)
@@ -468,6 +550,7 @@ def create_app() -> Flask:
             code=VALIDATION_ERROR,
             message=str(error),
             status=400,
+            cli_code=classify_cli_error(str(error)),
         )
 
     @app.errorhandler(RuntimeError)
@@ -491,6 +574,7 @@ def create_app() -> Flask:
             code=RATE_LIMITED,
             message="rate limit exceeded",
             status=429,
+            cli_code="rate_limited",
         )
         response.headers.setdefault("Retry-After", "60")
         return response, status
@@ -653,7 +737,11 @@ def create_app() -> Flask:
                 embedded_hash = workspace.sha256("embedded.mp4")
                 metadata_hash = canonical_metadata_hash(metadata)
         except QuarantineError as exc:
-            return jsonify({"error": str(exc)}), 400
+            return error_response(
+                code=UNSUPPORTED_MEDIA_TYPE,
+                message=str(exc),
+                status=400,
+            )
 
         db_event = insert_proof_event(
             event_type="embed",
@@ -757,6 +845,16 @@ def create_app() -> Flask:
             max_size=getattr(config, "upload_max_bytes", config.max_video_bytes),
         )
 
+        # Sniff assembled file before handing it to ffmpeg.
+        try:
+            sniff_media_type_path(combined_path)
+        except QuarantineError as exc:
+            return error_response(
+                code=UNSUPPORTED_MEDIA_TYPE,
+                message=str(exc),
+                status=400,
+            )
+
         with tempfile.TemporaryDirectory(prefix="harpocrates-") as tmp_dir:
             output_path = Path(tmp_dir) / "embedded.mp4"
             embed_metadata(combined_path, output_path, metadata)
@@ -836,7 +934,11 @@ def create_app() -> Flask:
                 video_hash = workspace.sha256("source.video")
                 metadata_hash = canonical_metadata_hash(metadata) if metadata else None
         except QuarantineError as exc:
-            return jsonify({"error": str(exc)}), 400
+            return error_response(
+                code=UNSUPPORTED_MEDIA_TYPE,
+                message=str(exc),
+                status=400,
+            )
 
         retention_class = request.headers.get("X-Harpocrates-Retention-Class") or (metadata.get("retentionClass", "default") if metadata else "default")
         if retention_class not in config.retention_classes:
@@ -973,6 +1075,73 @@ def create_app() -> Flask:
 
         return jsonify({"ok": True, "manifestDigest": manifest_digest, "db_event": db_event})
 
+    @app.post("/api/proofs/verify-batch")
+    @require_capacity(admission_controller)
+    def verify_batch():
+        if _enforce_json_size() > config.max_json_bytes:
+            return jsonify({"error": "JSON payload exceeds size limit"}), 413
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("proofs"), list):
+            return jsonify({"error": "JSON body with a 'proofs' array is required"}), 400
+
+        proofs = payload["proofs"]
+        if len(proofs) > config.max_batch_size:
+            return jsonify({"error": f"batch size exceeds limit of {config.max_batch_size}"}), 413
+
+        results = []
+        for idx, item in enumerate(proofs):
+            if not isinstance(item, dict):
+                results.append({"status": "malformed", "error": "item must be a JSON object", "index": idx})
+                continue
+            
+            video_hash = item.get("videoHash")
+            proof_id = item.get("proofId")
+            
+            if video_hash is not None and not is_hex_32(video_hash):
+                results.append({"videoHash": video_hash, "proofId": proof_id, "status": "malformed", "error": "invalid videoHash", "index": idx})
+                continue
+            if proof_id is not None and not is_hex_32(proof_id):
+                results.append({"videoHash": video_hash, "proofId": proof_id, "status": "malformed", "error": "invalid proofId", "index": idx})
+                continue
+            if not video_hash and not proof_id:
+                results.append({"status": "malformed", "error": "must provide videoHash or proofId", "index": idx})
+                continue
+
+            try:
+                events = []
+                if video_hash:
+                    events = find_proof_events_by_video(video_hash)
+                    if proof_id:
+                        events = [e for e in events if e.get("proof_id") == proof_id]
+                else:
+                    events = find_proof_events_by_proof_id(proof_id)
+                
+                if not events:
+                    results.append({"videoHash": video_hash, "proofId": proof_id, "status": "not_found", "events": [], "index": idx})
+                else:
+                    # Determine status from db events.
+                    # Since on-chain revocation isn't visible here, we use tx_status if available.
+                    has_confirmed = any(e.get("tx_status") == "confirmed" for e in events)
+                    has_failed = any(e.get("tx_status") == "failed" for e in events)
+                    has_revoked = any(e.get("tx_status") == "revoked" for e in events)  # Future compat
+                    
+                    if has_revoked:
+                        status = "revoked"
+                    elif has_confirmed:
+                        status = "verified"
+                    elif has_failed:
+                        status = "failed"
+                    else:
+                        status = "pending"
+                        
+                    results.append({"videoHash": video_hash, "proofId": proof_id, "status": status, "events": events, "index": idx})
+            except Exception as e:
+                # Catch dependency failure (e.g. database down) gracefully for the batch item
+                results.append({"videoHash": video_hash, "proofId": proof_id, "status": "dependency_failure", "error": str(e), "index": idx})
+
+        return jsonify({"ok": True, "results": results})
+
     @app.post("/api/proofs/register")
     @limiter.limit(config.ratelimit_register)
     @require_register_auth
@@ -988,7 +1157,12 @@ def create_app() -> Flask:
                 status=400,
             )
         if len(json.dumps(payload, separators=(",", ":")).encode("utf-8")) > config.max_metadata_bytes:
-            return jsonify({"error": "registration payload is too large"}), 413
+            return error_response(
+                code=PAYLOAD_TOO_LARGE,
+                message="registration payload is too large",
+                status=413,
+                cli_code=OVERSIZED_INPUT,
+            )
 
         video_hash = payload.get("videoHash")
         metadata_hash = payload.get("metadataHash")
@@ -1006,6 +1180,7 @@ def create_app() -> Flask:
                     code=VALIDATION_ERROR,
                     message=f"{name} must be a 32-byte hex string",
                     status=400,
+                    cli_code=MALFORMED_INPUT,
                 )
 
         tier = payload.get("tier")
@@ -1014,6 +1189,7 @@ def create_app() -> Flask:
                 code=VALIDATION_ERROR,
                 message="tier must be one of: silent, source, seal",
                 status=400,
+                cli_code=UNSUPPORTED_INPUT,
             )
 
         try:
@@ -1077,20 +1253,35 @@ def create_app() -> Flask:
                 time_att = decode_time_attestation(payload["timeAttestation"])
                 errors = validate_time_attestation(time_att, video_hash)
                 if errors:
-                    return jsonify({"error": "Invalid time attestation", "details": errors}), 400
+                    return error_response(
+                        code=VALIDATION_ERROR,
+                        message="Invalid time attestation",
+                        status=400,
+                        cli_code=classify_cli_error("time attestation is invalid"),
+                    )
                 time_attestation_data = encode_time_attestation(time_att)
                 if time_att.claimed_time:
                     claimed_capture_time = datetime.fromtimestamp(
                         time_att.claimed_time.unix_ms / 1000, tz=timezone.utc
                     ).isoformat()
             except (ValueError, TypeError) as exc:
-                return jsonify({"error": f"Time attestation error: {str(exc)}"}), 400
+                return error_response(
+                    code=VALIDATION_ERROR,
+                    message=f"Time attestation error: {str(exc)}",
+                    status=400,
+                    cli_code=classify_cli_error(str(exc)),
+                )
 
         idempotency_key = make_idempotency_key(video_hash, proof_id, normalized_tx_hash)
 
         retention_class = payload.get("retentionClass", "default")
         if retention_class not in config.retention_classes:
-            return jsonify({"error": f"invalid retention class: {retention_class}"}), 400
+            return error_response(
+                code=VALIDATION_ERROR,
+                message=f"invalid retention class: {retention_class}",
+                status=400,
+                cli_code=UNSUPPORTED_INPUT,
+            )
         retention_days = config.retention_classes[retention_class]
         expires_at = None
         if retention_days >= 0:
@@ -1121,12 +1312,105 @@ def create_app() -> Flask:
             }), 409
 
         if db_event and db_event.get("id") and created:
+            # A newly registered proof can change the on-chain verification
+            # result. Evict all cached results for this proof before clients
+            # perform the next verification lookup.
+            app.extensions["verifier_cache"].invalidate_proof(proof_id)
             queue_webhook_deliveries(db_event["id"])
             if normalized_tx_hash:
                 enqueue_job("verify_tx", {"proof_id": proof_id, "tx_hash": normalized_tx_hash, "contract_id": validated_contract_id})
 
         status = 201 if created else 200
         return jsonify({"ok": True, "db_event": db_event, "created": created}), status
+
+    @app.post("/api/proofs/reconcile")
+    def reconcile_registration_confirmations():
+        """Reconcile pending registration tx hashes against on-chain Horizon state.
+
+        Body (all optional):
+        - ``txHash``: reconcile a single hash; omit to batch pending rows
+        - ``limit``: max pending rows when batching (1–50, default 50)
+        - ``minConfirmations``: confirmation depth policy (default TX_MIN_CONFIRMATIONS)
+        - ``force``: overwrite terminal statuses (repair path)
+
+        Responses are privacy-safe: no metadata envelopes, media, or secrets.
+        """
+        if _enforce_json_size() > config.max_json_bytes:
+            return jsonify({"error": "JSON payload exceeds size limit"}), 413
+
+        payload = request.get_json(silent=True)
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="JSON body must be an object",
+                status=400,
+            )
+
+        if len(json.dumps(payload, separators=(",", ":")).encode("utf-8")) > config.max_metadata_bytes:
+            return jsonify({"error": "reconcile payload is too large"}), 413
+
+        force = bool(payload.get("force", False))
+        min_confirmations = payload.get("minConfirmations")
+        if min_confirmations is None:
+            min_confirmations = default_min_confirmations()
+        else:
+            try:
+                min_confirmations = int(min_confirmations)
+            except (TypeError, ValueError):
+                return error_response(
+                    code=VALIDATION_ERROR,
+                    message="minConfirmations must be an integer >= 1",
+                    status=400,
+                )
+            if min_confirmations < 1:
+                return error_response(
+                    code=VALIDATION_ERROR,
+                    message="minConfirmations must be an integer >= 1",
+                    status=400,
+                )
+
+        tx_hash = payload.get("txHash")
+        if tx_hash is not None:
+            try:
+                result = reconcile_registration(
+                    tx_hash,
+                    previous_status=None if force else "pending",
+                    min_confirmations=min_confirmations,
+                    force=force,
+                )
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+
+            if result.get("error") == "malformed_tx_hash":
+                return error_response(
+                    code=VALIDATION_ERROR,
+                    message="txHash must be a 32-byte hex string",
+                    status=400,
+                )
+            if result.get("status") == "error":
+                return jsonify({
+                    "ok": False,
+                    "error": "horizon_dependency_failure",
+                    "result": result,
+                }), 503
+            return jsonify({"ok": True, "result": result})
+
+        try:
+            limit = clamp_reconcile_limit(payload.get("limit", 50))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        try:
+            report = reconcile_pending_registrations(
+                limit=limit,
+                min_confirmations=min_confirmations,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        return jsonify(report)
 
     @app.post("/api/time-attestation/create")
     def create_time_attestation_endpoint():
@@ -1385,7 +1669,8 @@ def create_app() -> Flask:
         job = get_job(job_id)
         if not job:
             return jsonify({"error": "Job not found"}), 404
-        return jsonify({"ok": True, "job": job})
+        public_job = {key: value for key, value in job.items() if key != "_trace_context"}
+        return jsonify({"ok": True, "job": public_job})
 
     @app.get("/api/jobs/<int:job_id>/download")
     def download_job_result(job_id: int):
@@ -1504,7 +1789,17 @@ def create_app() -> Flask:
     @app.get("/api/schemas")
     def list_schemas():
         schemas = discover_schemas()
-        return jsonify({"ok": True, "schemas": schemas})
+        hashes = sorted(
+            s.get("schemaHash", "")
+            for s in schemas
+            if isinstance(s, dict) and s.get("schemaHash")
+        )
+        etag = '"' + hashlib.sha256("".join(hashes).encode()).hexdigest() + '"'
+        if request.headers.get("If-None-Match") == etag:
+            return "", 304
+        response = jsonify({"ok": True, "schemas": schemas})
+        response.headers["ETag"] = etag
+        return response
 
     @app.get("/api/schemas/<schema_hash>")
     def get_schema(schema_hash: str):
@@ -1513,7 +1808,16 @@ def create_app() -> Flask:
         schema = resolve_schema(schema_hash)
         if schema is None:
             return jsonify({"error": "schema not found"}), 404
-        return jsonify({"ok": True, "schema": schema})
+        etag = '"' + schema_hash.lower() + '"'
+        if request.headers.get("If-None-Match") == etag:
+            resp = app.response_class("", status=304)
+            resp.headers["ETag"] = etag
+            resp.headers["Cache-Control"] = "public, max-age=86400, immutable"
+            return resp
+        response = jsonify({"ok": True, "schema": schema})
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = "public, max-age=86400, immutable"
+        return response
 
     @app.post("/api/verify/selective-disclosure")
     def verify_selective_disclosure():
@@ -1528,11 +1832,20 @@ def create_app() -> Flask:
         if err is not None:
             return jsonify({"error": err}), 400
 
-        return jsonify({
+        response = {
             "ok": True,
             "message": "Selective disclosure proof submission accepted.",
             "note": "On-chain verification must be performed via verify_selective_disclosure on the registry contract.",
-        })
+        }
+        receipt_context = payload.get("receiptContext")
+        if receipt_context is not None:
+            if not isinstance(receipt_context, dict):
+                return jsonify({"error": "receiptContext must be a JSON object"}), 400
+            try:
+                response["verificationReceipt"] = build_verification_receipt(receipt_context)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+        return jsonify(response)
 
     # -----------------------------------------------------------------------
     # C2PA interoperability
@@ -1871,11 +2184,40 @@ def is_field_decimal(value: object) -> bool:
 
 
 def validate_video_upload(video) -> None:
+    """Validate an uploaded video *before* it is saved to disk or handed to ffmpeg.
+
+    Checks (in order):
+    1. Filename is present.
+    2. Declared ``Content-Type`` is in the ``video/*`` family or the generic
+       ``application/octet-stream`` wildcard.
+    3. **Media-type sniff** — reads the first 32 bytes of the upload stream and
+       verifies that a recognised video magic signature is present and consistent
+       with both the filename extension and the declared content type.  The stream
+       is rewound to offset 0 after the read so subsequent ``save()`` calls are
+       unaffected.
+
+    Raises :class:`QuarantineError` (a ``ValueError`` subclass) on any failure so
+    the existing ``except ValueError`` / ``except QuarantineError`` call sites keep
+    working unchanged.
+    """
     if not video.filename:
         raise ValueError("video filename is required")
+
     content_type = (video.content_type or "").lower()
     if content_type and not content_type.startswith("video/") and content_type != "application/octet-stream":
-        raise ValueError("video upload must use a video content type")
+        raise QuarantineError("video upload must use a video/* or application/octet-stream content type")
+
+    # Stream-level magic-byte sniff: detects mismatches between declared type
+    # and actual file contents before the file is persisted anywhere.
+    stream = getattr(video, "stream", None)
+    if stream is None:
+        # Fallback for duck-typed objects (e.g. test stubs) that expose .read()
+        stream = video
+    sniff_media_type_stream(
+        stream,
+        filename=video.filename,
+        content_type=video.content_type,
+    )
 
 
 

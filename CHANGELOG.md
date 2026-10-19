@@ -1,7 +1,48 @@
 # Changelog
 
+## Unreleased — Registry storage V2
+
+- Split registry-admin and active-issuer authority into strictly disjoint roles
+  with the stable `RoleConflict` (`#53`) authorization error.
+- Added read-only `is_admin`, `is_issuer`, and `get_schema_version` queries.
+- Added an idempotent storage V1-to-V2 migration that revokes only a conflicting
+  admin issuer record while preserving all evidence and protocol boundaries.
+
 ## 1.0.0 — Unreleased
 
+- Added a **circuit-versioned proof envelope** for the scoped silent witness
+  proof (#368): `silent_witness/v2` / `hpx-vi/2` is the 224-byte scoped frame plus
+  a trailing 32-byte `circuit_version` field element (8 × 32 = 256 bytes), and the
+  Noir circuit asserts that value against `CURRENT_CIRCUIT_VERSION` in-circuit, so
+  a proof names the circuit that produced it instead of leaving a verifier to
+  infer the version from a byte count. The envelope is **required** on the
+  registration path: `register_anonymous_verified` rejects the superseded bare
+  224-byte frame with `RegistryError::CircuitVersionMismatch` (new ABI code 87 in
+  `contracts/ERROR_ABI.md`) before the verifier is reached, so no proof can skip
+  the version commitment by omitting the trailer. `hpx-vi/1` (160-byte
+  `silent_witness/v1`, 128-byte revocation) is byte-for-byte unchanged, and
+  `circuit_version` is never written to `ProofRecord`, so stored evidence is
+  unaffected. Built the scoped ACIR with the pinned toolchain — 21 `nargo test`
+  cases pass, including the version-downgrade rejection — and refreshed the source
+  digests that cover it (`zk/circuit.provenance.json`,
+  `release/compatibility-manifest.json`); the tracked published browser artifacts
+  are a different, digest-pinned circuit shape and stay unchanged. Added a
+  `verifier_conformance_v2.json` corpus and put `nargo test` for the silent
+  witness circuits in CI. See `MIGRATION_GUIDE.md` and `THREAT_MODEL.md` (OR-5).
+- Added bounded **issuer rotation grace windows** to the Soroban registry (#323).
+  `rotate_issuer` retires an active issuer key in favour of a replacement and
+  opens a bounded window (default `DEFAULT_ISSUER_ROTATION_GRACE_SECS`, capped by
+  `MAX_ISSUER_ROTATION_GRACE_SECS`) during which the retired key's pre-rotation
+  evidence stays verifiable, while the retired key itself — and its delegates —
+  can no longer sign new seals. `is_issuer_verifiable` / `get_issuer_rotation`
+  expose standing without panicking, and `finalize_issuer_rotation` settles a
+  lapsed window and emits the grace-expiry event. `revoke_issuer`, its
+  timelocked twin, and `add_issuer` all clear a rotation record. Additive on
+  chain: `DataKey::IssuerRotation` is a new key and `IssuerRecord` keeps its
+  existing serialization, so stored evidence and compatible callers are
+  unaffected. New ABI codes 83–86 in `contracts/ERROR_ABI.md`; see
+  `MIGRATION_GUIDE.md` and `THREAT_MODEL.md` (T3).
+- Added a privacy-safe redaction preview in Evidence Studio that discloses truncated public fingerprints while withholding seeds, witness proofs, private keys, and media URLs (`frontend/src/redactionPreview.ts`).
 - chore(devx): retain proof artifacts in CI through a privacy-checked allowlist (#398)
 - Added the `redacted_ancestry` Noir circuit and helper (#356): proves a redacted
   derivative descends from a committed parent evidence object without revealing
@@ -44,6 +85,8 @@
   mutators (odd nibble, non-hex, empty, length edges), exact proof-bound tables,
   silence checks, and regression corpus entries `fz-011`–`fz-013` (#369).
 
+- Bound aggregation proof count at `MAX_AGGREGATION_SIZE = 8` (`MIN_AGGREGATION_SIZE = 1`) across Noir circuits, Soroban registry constants, backend/frontend verifier input validators, conformance vectors, and host tooling with structured, privacy-safe rejection codes (#488).
+
 - Bound `revocation_witness` Merkle depth at `MAX_REVOCATION_WITNESS_DEPTH = 3` (8 leaves) across the Noir circuit, registry constants, verifier codec, and host tooling (#357).
 
 - Closed an unpinned-circuit gap in the reproducible Noir build pipeline. The
@@ -67,8 +110,8 @@
 - Added a CI end-to-end environment matrix (`devx/e2e_env_matrix.py`) that exercises public API boundaries across development/testing/production-like profiles with privacy-safe failure checks.
 
 - Added an atomic compatibility manifest and release gate spanning frontend,
-- Added a cross-layer compatibility report that publishes version, interface, and digest alignment across frontend, backend, circuit, verifier, and registry without embedding private material.
   backend, Noir circuit/verifier, and Soroban registry artifacts.
+- Added a cross-layer compatibility report that publishes version, interface, and digest alignment across frontend, backend, circuit, verifier, and registry without embedding private material.
 - Established the `harpocrates:silent-witness:v1` cryptographic domain and v1
   metadata, public-input, and registry interface bindings.
 - Added staged rollout, rollback, artifact verification, and privacy-safe
@@ -79,3 +122,7 @@
   open-dispute caps, reporter cooldowns, respond/resolve deadlines, cycle-safe
   supersession, privacy-safe typed events, and additive storage that needs no
   migration. See `contracts/DISPUTE.md`.
+- Added a non-worker fallback for browser proof generation with explicit
+  limits (60s timeout, 256-byte secret cap, single concurrent request) and a
+  bounded runtime for Web Worker-unavailable environments; proof payloads are
+  unchanged and both runtimes verify identically.

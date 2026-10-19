@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Wallet } from 'lucide-react'
 import EvilEye from './components/EvilEye'
 import BatchVerificationWorkspace from './components/BatchVerificationWorkspace'
@@ -57,7 +57,7 @@ function App() {
 
   const liveStatus = useLiveRegion()
   const liveAlert = useLiveRegion()
-  const { statusLabel, isBusy } = useA11yStage(evidence.stage)
+  const { statusLabel } = useA11yStage(evidence.stage)
   const { mainRef, handleSkip } = useSkipLink()
 
   const prevStageRef = useRef(evidence.stage)
@@ -70,7 +70,7 @@ function App() {
     } else if (evidence.stage !== 'idle') {
       liveStatus.announce(statusLabel)
     }
-  }, [evidence.stage, evidence.message, statusLabel])
+  }, [evidence.stage, evidence.message, statusLabel, liveAlert, liveStatus])
 
   const viewHeadingId = currentView === 'studio'
     ? 'studio-heading'

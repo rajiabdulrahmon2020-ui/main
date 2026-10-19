@@ -127,7 +127,7 @@ describe('verification flow integration', () => {
     // We import the mock class to throw it
     const { MalformedEvidenceError } = await import('./stego')
     extractMetadata.mockRejectedValue(new MalformedEvidenceError())
-    const fetch = vi.spyOn(globalThis, 'fetch')
+    vi.spyOn(globalThis, 'fetch')
 
     const result = await runVerification()
 
@@ -139,7 +139,7 @@ describe('verification flow integration', () => {
 
   it('makes no trust decision when a verification service is unavailable', async () => {
     extractMetadata.mockResolvedValue({ protocol: 'harpocrates' })
-    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(new Error('offline'))
+    vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(new Error('offline'))
 
     const result = await runVerification()
 

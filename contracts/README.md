@@ -156,6 +156,10 @@ in the sequential branch inside `upgrade_storage`, preserve existing proof /
 video / nullifier records, and must never log media, secrets, witnesses, or
 private keys.
 
+A V1 wasm presented with a stored version greater than V1 leaves that version
+and the rest of storage untouched; it does not attempt a downgrade. Operators
+must use a wasm that supports the stored schema version.
+
 Rollback is redeploying a prior wasm: additive `SchemaVersion` keys are
 ignored by older readers, and no proof rewrite is required for the V1 stamp.
 Operators should call `get_storage_schema_version` after upgrade to confirm
@@ -230,6 +234,9 @@ upgrade_storage
 propose_admin
 cancel_admin_transfer
 accept_admin
+get_schema_version
+is_admin
+is_issuer
 add_credential_root
 revoke_credential_root
 get_credential_root
@@ -248,6 +255,10 @@ get_proof
 get_by_video
 has_nullifier
 get_issuer
+rotate_issuer
+finalize_issuer_rotation
+get_issuer_rotation
+is_issuer_verifiable
 set_revocation_root
 get_revocation_root
 check_non_revocation
@@ -318,6 +329,43 @@ storage key, so upgrading an initialized contract preserves its current admin
 and all existing registry data. An upgraded contract starts with no pending
 admin proposal.
 
+## Admin and issuer role separation (storage V2)
+
+Registry administration and Tier 3 issuance are disjoint roles. The admin can
+manage protocol state, credential roots, verifiers, proofs, and the issuer
+allowlist, but an active admin address cannot be granted issuer authority.
+An active issuer cannot be proposed or accepted as admin. Both rejected paths
+return the stable, privacy-safe `RoleConflict` contract error (`#53`); no media,
+metadata, witness, proof, or key material is included.
+
+`is_admin(address)` and `is_issuer(address)` expose the effective role without
+requiring authorization. They are read-only and accept arbitrary public
+addresses. `get_schema_version()` returns the storage schema version.
+
+### V1-to-V2 migration
+
+Fresh deployments initialize directly at storage V2. For an existing contract,
+the current admin calls `upgrade_storage` once:
+
+```text
+upgrade_storage(admin)
+```
+
+The migration is idempotent and narrow. It does not rewrite proof records,
+video/nullifier indexes, verifier state, credential roots, schemas, or issuer
+metadata. If the current admin has an active issuer record, only that record's
+`active` flag is changed to `false`; proof records and all other issuer records
+remain intact. Existing `DataKey::Admin`, `DataKey::Issuer`, and evidence layouts
+are unchanged. A successful migration emits the existing `IssuerRevoked` event
+(for the conflicting authority only) and `SchemaUpgraded { 1, 2 }`; no sensitive
+payload is emitted.
+
+Call `upgrade_storage` before enabling the V2 artifact in production. If code
+is rolled back to a prior Wasm artifact, stored evidence remains readable, but
+that older artifact does not enforce disjoint roles and can grant the admin an
+issuer record again. Re-upgrade and revoke that issuer record before resuming
+issuer operations.
+
 ## Emergency Pause
 
 Registration can be paused per identity tier without affecting reads or
@@ -347,6 +395,26 @@ Current Testnet verifier:
 CCP2EQPKT5XAYTOARX3LGHNMJ37A6W2WY3H54MRIHEZVTVAZZPUSGZQJ
 ```
 
+## Receipt Digest Commitment (#337)
+
+A signed verification receipt can be anchored on-chain without storing the
+receipt: the caller commits `sha256(canonical_json(receipt))` together with a
+P-256 attestation from an admin-managed receipt-signing key. The attestation
+signs a 129-byte domain-separated preimage that binds the contract address,
+`proof_id`, and the digest, so a signature cannot be replayed against another
+deployment, proof, or digest. One immutable commitment per proof; retries of
+the same digest are idempotent. Registration pauses do not gate receipt
+commits or signer management.
+
+| Function | Auth |
+|----------|------|
+| `add_receipt_signer` / `revoke_receipt_signer` | admin only (max 8 active keys) |
+| `commit_receipt_digest` | admin, the proof's tier-2 source, or its tier-3 issuer (tier 1: admin only) |
+| `get_receipt_commitment` / `get_receipt_signer` | public |
+
+See `RECEIPT_COMMITMENT.md` for the preimage layout, guard order, errors,
+events, and test-vector provenance.
+
 ## Events
 
 The registry emits typed Soroban events with `#[contractevent]`:
@@ -356,6 +424,8 @@ The registry emits typed Soroban events with `#[contractevent]`:
 ["proof", "revoke", proof_id]     => status
 ["issuer", "add", issuer]         => metadata_hash
 ["issuer", "revoke", issuer]      => {}
+["issuer", "rotate", previous_issuer] => replacement_issuer, rotated_at, grace_expires_at, grace_secs
+["issuer", "grace", issuer]       => replacement_issuer, grace_expires_at
 ["verif", "set", verifier]        => {}
 ["credroot", "add", root]         => metadata_hash, issued_at
 ["credroot", "revoke", root]      => {}
@@ -376,6 +446,9 @@ The registry emits typed Soroban events with `#[contractevent]`:
 ["verif", "schedule"]             => active_verifier, pending_verifier, activation_ledger, overlap_window, rollback_window
 ["verif", "activate"]             => active_verifier, previous_verifier, rollback_window_end
 ["verif", "rollback"]             => active_verifier, previous_verifier
+["receipt", "commit", proof_id]   => receipt_digest, tier, public_key, committed_at
+["signer", "add", public_key]     => added_at
+["signer", "revoke", public_key]  => revoked_at
 ```
 
 For every successful proof registration, `proof/reg` is emitted before the

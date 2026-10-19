@@ -32,12 +32,18 @@ class AppConfig:
     metrics_enabled: bool
     metrics_token: str | None
     metrics_path: str
+    tracing_enabled: bool
+    tracing_service_name: str
+    tracing_endpoint: str | None
+    tracing_sample_ratio: float
+    tracing_export_timeout_seconds: float
     register_api_key: str | None
     register_api_key_expires: datetime | None
     register_api_key_previous: str | None
     register_api_key_previous_expires: datetime | None
     retention_worker_enabled: bool
     retention_interval_seconds: int
+    retention_batch_size: int
     retention_classes: dict[str, int]
     max_concurrent_requests: int
     max_queue_size: int
@@ -99,12 +105,18 @@ def load_config() -> AppConfig:
         metrics_enabled=_bool_env("METRICS_ENABLED", True),
         metrics_token=_str_env("METRICS_TOKEN"),
         metrics_path=os.getenv("METRICS_PATH", "/metrics").strip(),
+        tracing_enabled=_bool_env("OTEL_ENABLED", False),
+        tracing_service_name=_str_env("OTEL_SERVICE_NAME") or "harpocrates-backend",
+        tracing_endpoint=_str_env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
+        tracing_sample_ratio=_sample_ratio_env("OTEL_TRACES_SAMPLER_ARG", 0.1),
+        tracing_export_timeout_seconds=_float_env("OTEL_EXPORT_TIMEOUT_SECONDS", 5.0),
         register_api_key=register_api_key,
         register_api_key_expires=register_api_key_expires,
         register_api_key_previous=register_api_key_previous,
         register_api_key_previous_expires=register_api_key_previous_expires,
         retention_worker_enabled=_bool_env("RETENTION_WORKER_ENABLED", False),
         retention_interval_seconds=_int_env("RETENTION_INTERVAL_SECONDS", 3600),
+        retention_batch_size=_retention_batch_size_env(),
         retention_classes={"default": 30, "short": 7, "long": 365},
         max_concurrent_requests=_int_env("MAX_CONCURRENT_REQUESTS", 50),
         max_queue_size=_int_env("MAX_QUEUE_SIZE", 100),
@@ -207,3 +219,34 @@ def _float_env(name: str, default: float) -> float:
     if parsed <= 0.0:
         raise RuntimeError(f"{name} must be positive")
     return parsed
+
+
+def _sample_ratio_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be between 0 and 1") from exc
+    if not 0.0 <= parsed <= 1.0:
+        raise RuntimeError(f"{name} must be between 0 and 1")
+    return parsed
+
+
+# Retention worker batch bounds. The upper bound must match
+# db.RETENTION_BATCH_MAX_SIZE, which clamps the value again at the SQL layer.
+RETENTION_BATCH_SIZE_DEFAULT = 100
+RETENTION_BATCH_SIZE_MAX = 5000
+
+
+def _retention_batch_size_env(name: str = "HARPOCRATES_RETENTION_BATCH_SIZE", default: int = RETENTION_BATCH_SIZE_DEFAULT) -> int:
+    """Load HARPOCRATES_RETENTION_BATCH_SIZE clamped to the 1..5000 range."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    return max(1, min(parsed, RETENTION_BATCH_SIZE_MAX))

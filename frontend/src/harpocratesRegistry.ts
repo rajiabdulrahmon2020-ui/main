@@ -16,9 +16,9 @@ import {
   scBytes32,
   scU32,
 } from './stellarEncoding'
+import { assertReleaseCompatibility } from './releaseCompatibility'
 import type {
   ChainProofRecord,
-  ChainVerifierState,
   IdentityTier,
   IssuerRecord,
   NormalizedRegisterProofInput,
@@ -29,6 +29,7 @@ import type {
   RegistryMethod,
   TxState,
 } from './stellarTypes'
+import { assertReleaseCompatibility } from './releaseCompatibility'
 
 const RPC_URL = import.meta.env.VITE_STELLAR_RPC_URL ?? 'https://soroban-testnet.stellar.org'
 
@@ -232,7 +233,7 @@ export async function getBatchProofStatuses(
     fee: BASE_FEE,
     networkPassphrase: NETWORK_PASSPHRASE,
   })
-    .addOperation(contract.call('get_proof_statuses' as any, scProofIds))
+    .addOperation(contract.call('get_proof_statuses', ...scProofIds))
     .setTimeout(30)
     .build()
 
@@ -248,7 +249,7 @@ export async function getBatchProofStatuses(
   if (!native || !Array.isArray(native)) return null
 
   // returns array of status enum values mapped to numbers
-  return native.map((val: any) => Number(val))
+  return native.map((val: unknown) => Number(val))
 }
 
 function normalizeRegisterProofInput(input: RegisterProofInput): NormalizedRegisterProofInput {
@@ -637,5 +638,47 @@ export async function correctProof(
     hash: submitted.hash,
     status: submitted.status,
     txState: initialTxState(submitted.status),
+  }
+}
+
+export async function getVerifierState(
+  contractId: string,
+  sourceAddress?: string,
+): Promise<ChainVerifierState | null> {
+  const source = sourceAddress || READONLY_SOURCE
+  if (!source) {
+    throw new Error('Set VITE_STELLAR_READONLY_SOURCE or connect a wallet for on-chain verification.')
+  }
+
+  const server = new rpc.Server(RPC_URL)
+  const account = await server.getAccount(source)
+  const contract = new Contract(contractId)
+  const transaction = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call('get_verifier_state' satisfies RegistryMethod))
+    .setTimeout(30)
+    .build()
+
+  const simulation = await server.simulateTransaction(transaction)
+  if (rpc.Api.isSimulationError(simulation)) {
+    throw new Error(simulation.error)
+  }
+  if (!rpc.Api.isSimulationSuccess(simulation) && !rpc.Api.isSimulationRestore(simulation)) {
+    return null
+  }
+
+  const native = simulation.result?.retval ? scValToNative(simulation.result.retval) : null
+  if (!native) return null
+
+  return {
+    activeVerifier: native.active_verifier ? String(native.active_verifier) : null,
+    pendingVerifier: native.pending_verifier ? String(native.pending_verifier) : null,
+    previousVerifier: native.previous_verifier ? String(native.previous_verifier) : null,
+    activationLedger: String(native.activation_ledger),
+    overlapWindow: String(native.overlap_window),
+    rollbackWindow: String(native.rollback_window),
+    rollbackWindowEnd: String(native.rollback_window_end),
   }
 }

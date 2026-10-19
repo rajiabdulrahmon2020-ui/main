@@ -5,8 +5,10 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
-    Bytes, BytesN, Env, IntoVal, InvokeError, Symbol, Val, Vec as SorobanVec,
+    Bytes, BytesN, Env, IntoVal, InvokeError, Symbol, Val, Vec,
 };
+
+pub type SorobanVec<T> = Vec<T>;
 
 pub mod verifier_inputs;
 
@@ -20,6 +22,10 @@ use verifier_inputs::{RejectCode, PUBLIC_INPUTS_LEN, REVOCATION_PUBLIC_INPUTS_LE
 /// Schema selectors accepted by [`HarpocratesRegistry::classify_public_inputs`].
 pub const SCHEMA_ID_SILENT_WITNESS: u32 = 1;
 pub const SCHEMA_ID_REVOCATION_WITNESS: u32 = 2;
+/// Circuit-versioned silent-witness envelope (`silent_witness/v2`, #368).
+/// Distinct from [`SCHEMA_ID_SILENT_WITNESS`] so `classify_public_inputs` can
+/// enforce the appended circuit-version field without touching the v1 codec.
+pub const SCHEMA_ID_SILENT_WITNESS_V2: u32 = 3;
 
 /// Maximum Merkle depth for the `revocation_witness` circuit (#357).
 /// Must match `MAX_REVOCATION_WITNESS_DEPTH` in the Noir circuit and host tooling.
@@ -44,6 +50,24 @@ const STATUS_POLICY_CANCELLED: u32 = 2;
 const MAX_SIGNERS: u32 = 16;
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 
+// ---------------------------------------------------------------------------
+// Lineage graph bounds (#333)
+// ---------------------------------------------------------------------------
+//
+// A lineage record is a directed edge from registered evidence (or another
+// derivative) to a new derivative. Both directions of every edge are bounded so
+// no single artefact can be amplified into an unbounded family:
+//
+// - `MAX_LINEAGE_FANOUT` caps the parents one derivative may name (in-degree)
+//   and the derivatives one parent may be charged for (out-degree).
+// - `MAX_LINEAGE_DEPTH` caps how far a derivative may sit from the evidence it
+//   descends from. Depth is derived from the parents, never taken from the
+//   caller, so the bound cannot be bypassed by asserting a smaller number.
+// - `MAX_LINEAGE_PAYLOAD_BYTES` caps the encoded lineage payload a registered
+//   edge stands for. The registry only ever sees 32-byte digests, so the bound
+//   it can check is the parent set; the compile-time assertion below keeps the
+//   two bounds consistent, and the manifest body bound is enforced by the
+//   backend that owns the manifest.
 const MAX_LINEAGE_DEPTH: u32 = 4;
 const MAX_LINEAGE_FANOUT: u32 = 4;
 const MAX_LINEAGE_PAYLOAD_BYTES: u32 = 4096;
@@ -51,7 +75,6 @@ const MAX_LINEAGE_PAYLOAD_BYTES: u32 = 4096;
 pub const MAX_LINEAGE_CHILDREN_PAGE: u32 = 50;
 /// Max indexed children stored per parent proof/digest (#335).
 pub const MAX_LINEAGE_CHILDREN_PER_PARENT: u32 = 256;
-
 
 // ---------------------------------------------------------------------------
 // Independent timestamp claims (#339)
@@ -76,6 +99,11 @@ pub const TIMESTAMP_ASSURANCE_CLAIMED: u32 = 1;
 pub const TIMESTAMP_ASSURANCE_OBSERVED: u32 = 2;
 pub const TIMESTAMP_ASSURANCE_INDEPENDENT: u32 = 3;
 
+/// A parent set that fits the fan-out cap must also fit the payload budget.
+const _: () = assert!(
+    (MAX_LINEAGE_FANOUT as usize) * 32 <= MAX_LINEAGE_PAYLOAD_BYTES as usize,
+    "MAX_LINEAGE_FANOUT parent digests must fit inside MAX_LINEAGE_PAYLOAD_BYTES"
+);
 
 // ---------------------------------------------------------------------------
 // On-chain metadata envelope versioning (#317)
@@ -100,7 +128,6 @@ pub const METADATA_ENVELOPE_VERSION_MAX: u32 = METADATA_ENVELOPE_V2;
 pub const METADATA_ENVELOPE_VERSION_DEFAULT: u32 = METADATA_ENVELOPE_V1;
 /// Maximum size of canonical evidence metadata stored on-chain: one 32-byte digest.
 pub const MAX_EVIDENCE_METADATA_HASH_BYTES: u32 = 32;
-
 
 // ---------------------------------------------------------------------------
 // Proof-history bounds (#90)
@@ -221,6 +248,86 @@ pub const MAX_DELEGATION_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 pub const MAX_DELEGATIONS_PER_GRANTOR: u32 = 32;
 
 // ---------------------------------------------------------------------------
+// Issuer rotation grace windows (#323)
+// ---------------------------------------------------------------------------
+//
+// A Tier 3 issuer key rotates out by activating a replacement and retiring the
+// old key. Retiring the key must not make evidence it already signed
+// unverifiable in the same transaction: the off-chain key-transparency
+// directory keeps pre-rotation signatures valid inside the predecessor's
+// validity window (`docs/issuer-key-transparency.md`), and the registry has to
+// express the same bounded window or the two public boundaries disagree.
+//
+// A rotation retires the previous key immediately — it can no longer sign new
+// seals — and opens a bounded grace window during which the evidence it already
+// signed stays verifiable. The window is lazy: readers compare
+// `grace_expires_at` against ledger time, so it lapses without a transaction,
+// and any caller may settle the record afterwards with
+// `finalize_issuer_rotation`, which publishes the grace-expiry event.
+//
+// `grace_secs == 0` selects `DEFAULT_ISSUER_ROTATION_GRACE_SECS`, so a rotation
+// can never silently drop the window. A request above
+// `MAX_ISSUER_ROTATION_GRACE_SECS`, or one whose `rotated_at + grace_secs`
+// overflows, fails closed with `InvalidIssuerRotationGrace`.
+//
+// Revocation outranks the window: `revoke_issuer`, its timelocked twin, and
+// `add_issuer` all clear any rotation record, so a withdrawn or re-onboarded
+// key never keeps standing it should not have.
+//
+// Migration. `DataKey::IssuerRotation(issuer)` is a new, additive key and the
+// stored `IssuerRecord` keeps its exact `{metadata_hash, active}` shape, so
+// records written by an earlier wasm still decode unchanged and a deployment
+// that never rotates reads as "no rotation" with standing decided by `active`
+// alone. Rolling back to a pre-#323 wasm ignores the key and falls back to the
+// `active` flag, which only widens acceptance for a retired key — never for a
+// revoked one, and never for new evidence after an explicit `revoke_issuer`.
+
+/// Grace window applied when `rotate_issuer` is called with `grace_secs == 0`
+/// (90 days). A rotation never silently leaves pre-rotation evidence uncovered.
+pub const DEFAULT_ISSUER_ROTATION_GRACE_SECS: u64 = 90 * 24 * 60 * 60;
+/// Longest grace window an admin may open in a single rotation (365 days).
+pub const MAX_ISSUER_ROTATION_GRACE_SECS: u64 = 365 * 24 * 60 * 60;
+
+// ---------------------------------------------------------------------------
+// Verifier circuit-version validation (#343)
+// ---------------------------------------------------------------------------
+//
+// Every proof that crosses the contract's public boundary was produced by a
+// specific Noir circuit version. Two parties own that fact: this wasm build
+// knows which frame versions its codec can frame and interpret, and the
+// configured external verifier is the authority on which circuit versions it
+// can actually check. This section binds those facts so a call cannot smuggle
+// a proof generated by a circuit the active verifier does not support.
+//
+// There is exactly one source of truth for each version value: the codec
+// constants in `verifier_inputs` and the circuit domain separators already in
+// this file. The implicit versions below are read off those existing
+// boundaries; this is not a second protocol truth.
+//
+// Compatibility. The active window defaults to the full built-in range and is
+// only narrowed by an explicit admin call, so existing deployments and stored
+// evidence validate exactly as before. A verifier that declares a window is
+// checked at the trust boundary *before* it is invoked, so an unsupported
+// version fails closed with a stable error instead of reaching a dependency
+// that cannot answer.
+
+/// Circuit version of the v1 silent-witness frame (160 bytes).
+pub const CIRCUIT_VERSION_SILENT_WITNESS_V1: u32 = 1;
+/// Circuit version of the v2 scoped-nullifier frame (224 bytes).
+pub const CIRCUIT_VERSION_SILENT_WITNESS_V2: u32 = 2;
+/// Circuit version of the revocation-witness frame (128 bytes).
+pub const CIRCUIT_VERSION_REVOCATION_WITNESS: u32 = 1;
+/// Circuit version of the aggregation proof (`AGGREGATION_DOMAIN_SEPARATOR`).
+pub const CIRCUIT_VERSION_AGGREGATION: u32 = 1;
+/// Circuit version of the selective-disclosure proof (carried in the frame).
+pub const CIRCUIT_VERSION_SELECTIVE_DISCLOSURE: u32 = CURRENT_SELECTIVE_DISCLOSURE_VERSION;
+
+/// Lowest circuit version this wasm build can frame and interpret.
+pub const MIN_SUPPORTED_CIRCUIT_VERSION: u32 = 1;
+/// Highest circuit version this wasm build can frame and interpret.
+pub const MAX_SUPPORTED_CIRCUIT_VERSION: u32 = CIRCUIT_VERSION_SILENT_WITNESS_V2;
+
+// ---------------------------------------------------------------------------
 // Verifier rotation state
 // ---------------------------------------------------------------------------
 #[contracttype]
@@ -235,6 +342,21 @@ pub struct VerifierState {
     pub rollback_window_end: u64,
 }
 
+/// A verifier's declared circuit-version window (#343).
+///
+/// Immutable record of what the active verifier was told it may check, plus
+/// who declared it and when. When no record exists the window is the full
+/// built-in `[MIN_SUPPORTED_CIRCUIT_VERSION, MAX_SUPPORTED_CIRCUIT_VERSION]`
+/// range, which is the pre-#343 behaviour.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierCircuitVersions {
+    pub min_version: u32,
+    pub max_version: u32,
+    pub set_by: Address,
+    pub set_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Timelocked verifier and policy administration (#86)
 // ---------------------------------------------------------------------------
@@ -247,9 +369,11 @@ pub enum ProposalAction {
     RevokeIssuer = 2,
     SetProofTtl = 3,
     RevokeCredentialRoot = 4,
+    ExpireCredentialRoot = 5,
 }
 
 pub const DEFAULT_SCOPE_EPOCH: u64 = 0;
+pub const MIN_AGGREGATION_SIZE: u32 = 1;
 pub const MAX_AGGREGATION_SIZE: u32 = 8;
 pub const AGGREGATION_DOMAIN_SEPARATOR: [u8; 32] = [0u8; 32];
 
@@ -356,7 +480,6 @@ pub struct LineageRecord {
     pub depth: u32,
 }
 
-
 /// On-chain independent timestamp claim for a registered proof (#339).
 ///
 /// Stores commitments and ledger-derived anchors only — never TSA token
@@ -383,7 +506,6 @@ pub struct TimestampClaim {
     /// Derived assurance level (`TIMESTAMP_ASSURANCE_*`).
     pub assurance: u32,
 }
-
 
 /// One page of child output digests for a lineage parent (#335).
 #[contracttype]
@@ -436,12 +558,44 @@ pub struct IssuerRecord {
     pub active: bool,
 }
 
+/// Rotation grace record for an issuer key that has rotated out (#323).
+///
+/// Keyed by the *previous* (retired) key at `DataKey::IssuerRotation(Address)`
+/// so the stored `IssuerRecord` keeps its byte-identical `{metadata_hash,
+/// active}` shape and records written by an earlier wasm still decode.
+/// Presence means "this key was rotated, not revoked, and the evidence it
+/// already signed stays verifiable until `grace_expires_at`".
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuerRotationRecord {
+    /// The key that rotated out — also the record's storage key.
+    pub previous_issuer: Address,
+    /// The active key that replaced it.
+    pub replacement_issuer: Address,
+    /// Ledger timestamp at which the rotation was accepted.
+    pub rotated_at: u64,
+    /// Epoch seconds after which the grace window has lapsed. A reader at
+    /// exactly this timestamp sees the window as already closed.
+    pub grace_expires_at: u64,
+    /// Resolved window length (the protocol default when the caller passed 0).
+    pub grace_secs: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialRootRecordV1 {
+    pub metadata_hash: BytesN<32>,
+    pub active: bool,
+    pub issued_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialRootRecord {
     pub metadata_hash: BytesN<32>,
-    pub active: bool,
+    pub status: u32,
     pub issued_at: u64,
+    pub expires_at: u64,
 }
 
 /// Pause record for a single registration domain bit. Presence of a record
@@ -549,6 +703,29 @@ pub struct IssuerRevoked {
     pub issuer: Address,
 }
 
+/// Emitted when an active issuer key rotates to a replacement (#323).
+///
+/// Carries addresses, ledger time, and the grace bound only — never key
+/// material, metadata preimages, witnesses, media, or secrets.
+#[contractevent(topics = ["issuer", "rotate"])]
+pub struct IssuerRotated {
+    #[topic]
+    pub previous_issuer: Address,
+    pub replacement_issuer: Address,
+    pub rotated_at: u64,
+    pub grace_expires_at: u64,
+    pub grace_secs: u64,
+}
+
+/// Emitted when a rotation grace window is settled after it lapses (#323).
+#[contractevent(topics = ["issuer", "grace"])]
+pub struct IssuerRotationGraceExpired {
+    #[topic]
+    pub issuer: Address,
+    pub replacement_issuer: Address,
+    pub grace_expires_at: u64,
+}
+
 #[contractevent(topics = ["verif", "set"])]
 pub struct VerifierSet {
     #[topic]
@@ -580,6 +757,16 @@ pub struct VerifierRotationRolledBack {
     pub previous_verifier: Address,
 }
 
+/// Emitted when the admin narrows or widens the active verifier's supported
+/// circuit-version window (#343). Version numbers only — no witness material.
+#[contractevent(topics = ["verif", "versions"])]
+pub struct VerifierCircuitVersionsSet {
+    #[topic]
+    pub verifier: Address,
+    pub min_version: u32,
+    pub max_version: u32,
+}
+
 #[contractevent(topics = ["credroot", "add"])]
 pub struct CredentialRootAdded {
     #[topic]
@@ -592,6 +779,13 @@ pub struct CredentialRootAdded {
 pub struct CredentialRootRevoked {
     #[topic]
     pub credential_root: BytesN<32>,
+}
+
+#[contractevent(topics = ["credroot", "expire"])]
+pub struct CredentialRootExpired {
+    #[topic]
+    pub credential_root: BytesN<32>,
+    pub expired_at: u64,
 }
 
 /// Domain-separated, privacy-safe proof lifecycle history event (#90).
@@ -808,6 +1002,71 @@ pub struct DisputeSuperseded {
     pub resolved_at: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Signed receipt digest commitment (#337)
+// ---------------------------------------------------------------------------
+
+/// Admin-managed receipt-signing key record. `public_key` is a SEC-1
+/// encoded uncompressed P-256 point (`0x04 || X || Y`); public keys are not
+/// secrets, and no private key material is ever stored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptSignerRecord {
+    pub public_key: BytesN<65>,
+    /// False once revoked. Revocation is recorded rather than deleted so an
+    /// operator can distinguish "revoked" from "never registered".
+    pub active: bool,
+    pub added_at: u64,
+    /// 0 while the signer is active.
+    pub revoked_at: u64,
+}
+
+/// Immutable commitment to a signed verification receipt for one proof.
+///
+/// Privacy: every field is a commitment, an address, an identifier, or a
+/// timestamp. No receipt bytes, media, metadata hashes, witness values,
+/// signatures, or private keys are stored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptCommitmentRecord {
+    pub proof_id: BytesN<32>,
+    /// `sha256(canonical_json(signed_verification_receipt))`.
+    pub receipt_digest: BytesN<32>,
+    /// Identity tier of the committed proof at commit time (1, 2, or 3).
+    pub tier: u32,
+    /// The attesting receipt-signing public key.
+    pub public_key: BytesN<65>,
+    /// Address that authorized the commit (proof subject or admin).
+    pub committed_by: Address,
+    pub committed_at: u64,
+}
+
+/// Emitted on the first successful commit for a proof. Idempotent retries
+/// emit nothing, so exactly one `["receipt", "commit"]` exists per proof.
+#[contractevent(topics = ["receipt", "commit"])]
+pub struct ReceiptDigestCommitted {
+    #[topic]
+    pub proof_id: BytesN<32>,
+    pub receipt_digest: BytesN<32>,
+    pub tier: u32,
+    pub public_key: BytesN<65>,
+    pub committed_at: u64,
+}
+
+#[contractevent(topics = ["signer", "add"])]
+pub struct ReceiptSignerAdded {
+    #[topic]
+    pub public_key: BytesN<65>,
+    pub added_at: u64,
+}
+
+#[contractevent(topics = ["signer", "revoke"])]
+pub struct ReceiptSignerRevocation {
+    #[topic]
+    pub public_key: BytesN<65>,
+    pub revoked_at: u64,
+}
+
 /// Schema record for issuer-certified attribute schemas.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -899,8 +1158,31 @@ pub const DOMAIN_NETWORK_FIELD: [u8; 32] = [
 /// Expected length of v1 public inputs (5 × 32 = 160 bytes, including domain_tag).
 const SILENT_WITNESS_V1_INPUT_LEN: u32 = 160;
 
-/// Expected length of v2 scoped public inputs (7 × 32 = 224 bytes, including domain_tag).
-const SILENT_WITNESS_V2_INPUT_LEN: u32 = 224;
+/// Length of the superseded bare v2 scoped frame (7 x 32 = 224 bytes, including
+/// domain_tag). It commits no circuit version, so a verifier could only *infer*
+/// one from the length. `register_anonymous_verified` rejects it outright with
+/// [`RegistryError::CircuitVersionMismatch`]; it is declared here only so that
+/// the rejection has a named, documented length instead of falling through to
+/// the generic `InvalidPublicInputs` arm.
+const SILENT_WITNESS_V2_BARE_INPUT_LEN: u32 = 224;
+
+/// Expected length of the circuit-versioned v2 envelope (#368): the 224-byte
+/// scoped frame plus a trailing 32-byte `circuit_version` field element. This
+/// is the `silent_witness/v2` frame of the canonical codec, so the length comes
+/// from [`verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN`] rather than
+/// being restated here.
+///
+/// [`HarpocratesRegistry::register_anonymous_verified`] accepts only this frame
+/// for the v2 path; a trailer other than
+/// [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`] is rejected with
+/// [`RegistryError::CircuitVersionMismatch`].
+const SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN: u32 =
+    verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN as u32;
+
+/// Byte offset of the trailing `circuit_version` field inside the envelope: the
+/// envelope is the scoped frame followed by exactly one field element.
+const CIRCUIT_VERSION_TRAILER_OFFSET: usize =
+    verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN - verifier_inputs::FIELD_LEN;
 
 #[contractevent(topics = ["revroot", "set"])]
 pub struct RevocationRootSet {
@@ -1030,12 +1312,90 @@ pub struct TimelockMinDelaySet {
 #[repr(u32)]
 pub enum SchemaVersion {
     V1 = 1,
+    V2 = 2,
 }
 
 #[contractevent(topics = ["schema", "upgrade"])]
 pub struct SchemaUpgraded {
     pub previous: u32,
     pub current: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Paginated verifier-set inspection
+// ---------------------------------------------------------------------------
+//
+// `list_verifiers` returns a bounded, stable page of the current verifier
+// configuration — the active slot, the pending slot (if a rotation is
+// scheduled), and the previous slot (if within the rollback window).
+//
+// Design constraints:
+//   - Callers supply a u32 `cursor` (slot index, 0-based) and a `limit` (max
+//     entries per page). Cursor 0 starts at the first populated slot.
+//   - A cursor beyond the end of the populated slot list returns an empty
+//     page — not an error — so callers can safely probe with any cursor.
+//   - `limit` must be non-zero and at most MAX_VERIFIER_LIST_LIMIT.
+//   - No authentication is required (identical to `get_verifier`).
+//   - Slots are always ordered: Active → Pending → Previous.
+//     This ordering is stable across rotation events, so callers can page
+//     incrementally without re-reading prior pages.
+//   - Only populated (non-None) slots appear in `entries`, so the
+//     `next_cursor` can skip unpopulated slots.
+//   - `total_populated` exposes the total number of non-None slots at call
+//     time; it is informational only and safe to expose because addresses
+//     are already visible via `get_verifier` / `get_verifier_state`.
+//
+// Privacy invariants:
+//   - No private witness values, credential secrets, video hashes, or
+//     nullifiers are surfaced through this function.
+//   - An out-of-range cursor returns a stable empty page (not a
+//     revealing error) so a scanner cannot enumerate capacity by probing.
+//
+// Migration: These are new, additive storage keys and a new contract
+// entry point. Existing deployments return an empty VerifierPage until
+// `set_verifier` or a rotation is configured. Rolling back to a pre-this
+// wasm simply removes the entry point; callers fall back to `get_verifier`.
+
+/// Maximum number of verifier entries a single `list_verifiers` call may return.
+pub const MAX_VERIFIER_LIST_LIMIT: u32 = 10;
+
+/// The role of a verifier address in the current rotation state.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum VerifierRole {
+    Active = 1,
+    Pending = 2,
+    Previous = 3,
+}
+
+/// A single verifier slot returned by `list_verifiers`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierEntry {
+    /// The verifier contract address for this slot.
+    pub address: Address,
+    /// The role of this verifier in the current configuration.
+    pub role: VerifierRole,
+}
+
+/// Paginated result from `list_verifiers`.
+///
+/// `entries` contains up to `limit` `VerifierEntry` items in slot order
+/// (Active → Pending → Previous). Only non-None slots are included.
+///
+/// `next_cursor` is `Some(offset)` when more items exist beyond this page,
+/// or `None` when the page is the last (or only) page. Pass `next_cursor`
+/// as the `cursor` argument in the subsequent call.
+///
+/// `total_populated` is the total count of populated (non-None) verifier
+/// slots at the time of the query. It is always ≤ 3.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierPage {
+    pub entries: SorobanVec<VerifierEntry>,
+    pub next_cursor: Option<u32>,
+    pub total_populated: u32,
 }
 
 #[contracttype]
@@ -1045,7 +1405,10 @@ pub enum DataKey {
     Video(BytesN<32>),
     Nullifier(BytesN<32>),
     CredentialRoot(BytesN<32>),
+    CredentialRootV2(BytesN<32>),
     Issuer(Address),
+    /// Rotation grace record for an issuer key that has rotated out (#323).
+    IssuerRotation(Address),
     Verifier,
     ProofTtl,
     /// Optional emergency-pause guardian, distinct from admin (#87).
@@ -1063,6 +1426,8 @@ pub enum DataKey {
     DelegationCount(Address),
     /// Verifier rotation state (schedule/activate/rollback).
     VerifierState,
+    /// Declared circuit-version window for the active verifier (#343).
+    VerifierCircuitVersions,
     /// Storage schema version.
     SchemaVersion,
     /// Scope epoch for verifier-scope binding.
@@ -1093,6 +1458,8 @@ pub enum DataKey {
     /// Tracks the last-opened timestamp for a reporter_hash/proof pair.
     /// Key is the caller-supplied `reporter_hash` (a 32-byte commitment).
     ReporterCooldown(BytesN<32>),
+    /// Scoped nullifier separated by verifier address context (#325).
+    VerifierNullifier(Address, BytesN<32>),
 }
 
 #[contracterror]
@@ -1112,7 +1479,10 @@ pub enum RegistryError {
     UnknownCredentialRoot = 11,
     RevokedCredentialRoot = 12,
     HistorySaturated = 13,
-    InvalidHistoryAction = 14,
+    /// The scoped-nullifier proof carries an epoch that does not match the
+    /// current on-chain epoch for its scope. Replaces the unused
+    /// `InvalidHistoryAction` slot so the wire code does not change.
+    StaleEpoch = 14,
     InvalidReasonCode = 15,
     HistoryLimitExceeded = 16,
     AlreadyExpired = 17,
@@ -1163,6 +1533,11 @@ pub enum RegistryError {
     UnknownSchema = 50,
     InactiveSchema = 51,
     SchemaVersionMismatch = 52,
+    /// The cursor supplied to `list_verifiers` is out of range or malformed.
+    /// Returns a stable, privacy-safe failure that does not reveal set size.
+    InvalidCursor = 53,
+    /// The `limit` supplied to `list_verifiers` exceeds `MAX_VERIFIER_LIST_LIMIT`.
+    ListLimitExceeded = 54,
     // --- Restored feature errors (append-only; never renumber existing) ---
     /// A scoped-nullifier proof was generated for a stale scope epoch.
     StaleEpoch = 53,
@@ -1174,6 +1549,7 @@ pub enum RegistryError {
     BatchCountMismatch = 56,
     /// A lineage parent proof/lineage record was not found.
     InvalidLineage = 57,
+    ExpiredCredentialRoot = 58,
     /// A lineage edge would introduce a cycle.
     LineageCycle = 58,
     /// The requested lineage depth exceeds `MAX_LINEAGE_DEPTH`.
@@ -1220,6 +1596,24 @@ pub enum RegistryError {
     MetadataEnvelopeNotFound = 70,
     /// Bound envelope hash does not match the proof's `metadata_hash` (#317).
     MetadataEnvelopeHashMismatch = 71,
+    /// Proof declares a circuit version outside the active verifier's window (#343).
+    UnsupportedCircuitVersion = 81,
+    /// Requested circuit-version window is empty or outside the wasm range (#343).
+    InvalidCircuitVersionRange = 82,
+    /// Requested rotation grace window is above `MAX_ISSUER_ROTATION_GRACE_SECS`
+    /// or overflows ledger time (#323).
+    InvalidIssuerRotationGrace = 83,
+    /// A rotation named the same issuer key twice; absent or inactive keys
+    /// report `UnknownIssuer` instead (#323).
+    InvalidIssuerRotation = 84,
+    /// No issuer rotation grace record exists for the requested key (#323).
+    IssuerRotationNotFound = 85,
+    /// The issuer rotation grace window has not lapsed yet (#323).
+    IssuerRotationGraceStillActive = 86,
+    /// A scoped-nullifier envelope carried a `circuit_version` trailer other
+    /// than [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`], or was the superseded
+    /// bare 224-byte frame that commits no circuit version at all (#368).
+    CircuitVersionMismatch = 87,
 }
 
 #[contract]
@@ -1236,7 +1630,7 @@ impl HarpocratesRegistry {
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage()
             .persistent()
-            .set(&DataKey::SchemaVersion, &(SchemaVersion::V1 as u32));
+            .set(&DataKey::SchemaVersion, &(SchemaVersion::V2 as u32));
     }
 
     /// Return the persistent storage schema version.
@@ -1273,33 +1667,51 @@ impl HarpocratesRegistry {
             .get(&DataKey::SchemaVersion)
             .unwrap_or(SchemaVersion::V1 as u32);
 
-        let target_version = SchemaVersion::V1 as u32;
+        let target_version = SchemaVersion::V2 as u32;
 
         // Legacy pre-#85 registries: stamp V1 without a SchemaUpgraded event.
         if !had_version {
             env.storage()
                 .persistent()
-                .set(&DataKey::SchemaVersion, &target_version);
-            return;
+                .set(&DataKey::SchemaVersion, &(SchemaVersion::V1 as u32));
+            // Current version conceptually becomes V1 here
         }
 
-        if current_version < target_version {
+        let actual_current = if !had_version {
+            SchemaVersion::V1 as u32
+        } else {
+            current_version
+        };
+
+        if actual_current < target_version {
             // Migrations will be added here when moving to V2, V3, etc.
+            // V1 -> V2: Domain-separated nullifiers by verifier context (#325).
+            // Legacy nullifiers are preserved, so no iterative key rewrite is required.
 
             env.storage()
                 .persistent()
                 .set(&DataKey::SchemaVersion, &target_version);
 
             SchemaUpgraded {
-                previous: current_version,
+                previous: actual_current,
                 current: target_version,
             }
             .publish(&env);
         }
     }
 
+    /// Return the active storage schema version. Legacy deployments that have
+    /// not called `upgrade_storage` report `V1`; fresh V2 deployments report `V2`.
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(SchemaVersion::V1 as u32)
+    }
+
     pub fn propose_admin(env: Env, admin: Address, pending_admin: Address) {
         require_admin(&env, &admin);
+        require_admin_role_available(&env, &pending_admin);
 
         env.storage()
             .persistent()
@@ -1338,6 +1750,7 @@ impl HarpocratesRegistry {
         if proposed_admin != pending_admin {
             panic_with_error!(&env, RegistryError::Unauthorized);
         }
+        require_admin_role_available(&env, &pending_admin);
 
         let previous_admin: Address = env
             .storage()
@@ -1357,6 +1770,16 @@ impl HarpocratesRegistry {
 
     pub fn add_issuer(env: Env, admin: Address, issuer: Address, metadata_hash: BytesN<32>) {
         require_admin(&env, &admin);
+        require_issuer_role_available(&env, &issuer);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::PendingAdmin)
+            .as_ref()
+            == Some(&issuer)
+        {
+            panic_with_error!(&env, RegistryError::RoleConflict);
+        }
 
         env.storage().persistent().set(
             &DataKey::Issuer(issuer.clone()),
@@ -1365,6 +1788,12 @@ impl HarpocratesRegistry {
                 active: true,
             },
         );
+        // Re-adding a key makes it the current key again, so a leftover
+        // rotation grace record for it would be a second, contradictory answer
+        // to `is_issuer_verifiable` (#323).
+        env.storage()
+            .persistent()
+            .remove(&DataKey::IssuerRotation(issuer.clone()));
         IssuerAdded {
             issuer,
             metadata_hash,
@@ -1379,11 +1808,99 @@ impl HarpocratesRegistry {
             .persistent()
             .set(&DataKey::Verifier, &verifier);
         env.storage().persistent().remove(&DataKey::VerifierState);
+        // A freshly configured verifier has not declared a window yet; fall
+        // back to the full built-in range rather than inheriting the previous
+        // verifier's claim.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierCircuitVersions);
         VerifierSet { verifier }.publish(&env);
     }
 
     pub fn get_verifier(env: Env) -> Option<Address> {
         env.storage().persistent().get(&DataKey::Verifier)
+    }
+
+    /// Declare the circuit-version window the active verifier can check (#343).
+    ///
+    /// Admin-only and additive. `min_version..=max_version` must lie inside
+    /// this wasm build's own supported range; an empty or out-of-range window
+    /// fails with the stable `InvalidCircuitVersionRange` code rather than
+    /// being silently clamped. Once declared, every proof-verifying entry point
+    /// refuses a proof whose circuit version falls outside the window *before*
+    /// the external verifier is invoked, so an unsupported version can never
+    /// reach a dependency that cannot answer.
+    ///
+    /// Restore the default by setting the window back to
+    /// `MIN_SUPPORTED_CIRCUIT_VERSION..=MAX_SUPPORTED_CIRCUIT_VERSION`.
+    pub fn set_verifier_circuit_versions(
+        env: Env,
+        admin: Address,
+        min_version: u32,
+        max_version: u32,
+    ) {
+        require_admin(&env, &admin);
+
+        if min_version > max_version
+            || min_version < MIN_SUPPORTED_CIRCUIT_VERSION
+            || max_version > MAX_SUPPORTED_CIRCUIT_VERSION
+        {
+            panic_with_error!(&env, RegistryError::InvalidCircuitVersionRange);
+        }
+
+        let verifier = get_active_verifier(&env);
+        env.storage().persistent().set(
+            &DataKey::VerifierCircuitVersions,
+            &VerifierCircuitVersions {
+                min_version,
+                max_version,
+                set_by: admin,
+                set_at: env.ledger().timestamp(),
+            },
+        );
+        VerifierCircuitVersionsSet {
+            verifier,
+            min_version,
+            max_version,
+        }
+        .publish(&env);
+    }
+
+    /// The active verifier's circuit-version window (#343).
+    ///
+    /// An undeclared window answers as the full built-in range, so a pre-#343
+    /// deployment reports what it actually enforces instead of erroring.
+    pub fn get_verifier_circuit_versions(env: Env) -> VerifierCircuitVersions {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, VerifierCircuitVersions>(&DataKey::VerifierCircuitVersions)
+        {
+            Some(record) => record,
+            None => VerifierCircuitVersions {
+                min_version: MIN_SUPPORTED_CIRCUIT_VERSION,
+                max_version: MAX_SUPPORTED_CIRCUIT_VERSION,
+                set_by: env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Admin)
+                    .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotInitialized)),
+                set_at: 0,
+            },
+        }
+    }
+
+    /// Read-only: may a proof carrying `version` be accepted right now?
+    ///
+    /// True only when `version` is both framable by this wasm build and inside
+    /// the active verifier's declared window. Callers can pre-flight without a
+    /// trial transaction.
+    pub fn is_supported_circuit_version(env: Env, version: u32) -> bool {
+        if version < MIN_SUPPORTED_CIRCUIT_VERSION || version > MAX_SUPPORTED_CIRCUIT_VERSION {
+            return false;
+        }
+        let (min_version, max_version) = get_verifier_circuit_versions_raw(&env);
+        version >= min_version && version <= max_version
     }
 
     pub fn schedule_verifier_rotation(
@@ -1445,6 +1962,11 @@ impl HarpocratesRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Verifier, &pending_verifier);
+        // The incoming verifier must declare its own window; do not inherit the
+        // outgoing verifier's circuit-version claim.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierCircuitVersions);
         VerifierRotationActivated {
             active_verifier: pending_verifier,
             previous_verifier: active_verifier,
@@ -1474,6 +1996,9 @@ impl HarpocratesRegistry {
             .persistent()
             .set(&DataKey::Verifier, &previous_verifier);
         env.storage().persistent().remove(&DataKey::VerifierState);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierCircuitVersions);
         VerifierRotationRolledBack {
             active_verifier: previous_verifier.clone(),
             previous_verifier: active_verifier,
@@ -1495,11 +2020,12 @@ impl HarpocratesRegistry {
 
         let issued_at = env.ledger().timestamp();
         env.storage().persistent().set(
-            &DataKey::CredentialRoot(credential_root.clone()),
+            &DataKey::CredentialRootV2(credential_root.clone()),
             &CredentialRootRecord {
                 metadata_hash: metadata_hash.clone(),
-                active: true,
+                status: STATUS_REGISTERED,
                 issued_at,
+                expires_at: 0,
             },
         );
         CredentialRootAdded {
@@ -1514,11 +2040,23 @@ impl HarpocratesRegistry {
         require_admin(&env, &admin);
 
         let mut record = get_credential_root_record(&env, &credential_root);
-        record.active = false;
+        record.status = STATUS_REVOKED;
         env.storage()
             .persistent()
-            .set(&DataKey::CredentialRoot(credential_root.clone()), &record);
+            .set(&DataKey::CredentialRootV2(credential_root.clone()), &record);
         CredentialRootRevoked { credential_root }.publish(&env);
+    }
+
+    pub fn expire_credential_root(env: Env, admin: Address, credential_root: BytesN<32>) {
+        require_admin(&env, &admin);
+
+        let mut record = get_credential_root_record(&env, &credential_root);
+        record.status = STATUS_EXPIRED;
+        record.expires_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::CredentialRootV2(credential_root.clone()), &record);
+        CredentialRootExpired { credential_root, expired_at: record.expires_at }.publish(&env);
     }
 
     pub fn get_credential_root(
@@ -1538,7 +2076,183 @@ impl HarpocratesRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Issuer(issuer.clone()), &record);
+        // Revocation outranks any rotation grace window: a withdrawn or
+        // compromised key must never keep standing through a rotation record
+        // (#323).
+        env.storage()
+            .persistent()
+            .remove(&DataKey::IssuerRotation(issuer.clone()));
         IssuerRevoked { issuer }.publish(&env);
+    }
+
+    /// Rotate an active issuer key to a replacement, opening a bounded grace
+    /// window over the retiring key's pre-rotation evidence (#323).
+    ///
+    /// Admin-only. `previous_issuer` and `replacement_issuer` must be distinct,
+    /// both registered, and both active. The rotation retires `previous_issuer`
+    /// immediately — it can no longer sign new seals, directly or through a
+    /// delegation — while the evidence it already signed stays verifiable until
+    /// `grace_expires_at`, after which [`Self::is_issuer_verifiable`] fails
+    /// closed.
+    ///
+    /// `grace_secs == 0` selects [`DEFAULT_ISSUER_ROTATION_GRACE_SECS`].
+    /// Returns the absolute `grace_expires_at` so a caller can record the
+    /// deadline without re-reading storage. The window is lazy — it lapses with
+    /// no transaction — and [`Self::finalize_issuer_rotation`] settles the
+    /// record afterwards.
+    ///
+    /// # Reverts
+    ///
+    /// - `Unauthorized`               if the caller is not the admin
+    /// - `InvalidIssuerRotation`      if previous and replacement are equal
+    /// - `UnknownIssuer`              if either key is absent or inactive
+    /// - `InvalidIssuerRotationGrace` if `grace_secs` exceeds
+    ///   [`MAX_ISSUER_ROTATION_GRACE_SECS`] or the window would overflow ledger
+    ///   time
+    pub fn rotate_issuer(
+        env: Env,
+        admin: Address,
+        previous_issuer: Address,
+        replacement_issuer: Address,
+        grace_secs: u64,
+    ) -> u64 {
+        require_admin(&env, &admin);
+
+        if previous_issuer == replacement_issuer {
+            panic_with_error!(&env, RegistryError::InvalidIssuerRotation);
+        }
+
+        let mut previous = get_issuer_record(&env, &previous_issuer);
+        if !previous.active {
+            panic_with_error!(&env, RegistryError::UnknownIssuer);
+        }
+        let replacement = get_issuer_record(&env, &replacement_issuer);
+        if !replacement.active {
+            panic_with_error!(&env, RegistryError::UnknownIssuer);
+        }
+
+        // `0` means "use the protocol default", never "no window": a rotation
+        // that left pre-rotation evidence unverifiable in the same transaction
+        // would break the boundary this feature exists to keep.
+        let resolved_grace = if grace_secs == 0 {
+            DEFAULT_ISSUER_ROTATION_GRACE_SECS
+        } else {
+            grace_secs
+        };
+        if resolved_grace > MAX_ISSUER_ROTATION_GRACE_SECS {
+            panic_with_error!(&env, RegistryError::InvalidIssuerRotationGrace);
+        }
+
+        let rotated_at = env.ledger().timestamp();
+        let grace_expires_at = rotated_at
+            .checked_add(resolved_grace)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::InvalidIssuerRotationGrace));
+
+        // Retire the previous key immediately: a rotated-out key must not sign
+        // anything new, grace window or not.
+        previous.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Issuer(previous_issuer.clone()), &previous);
+
+        env.storage().persistent().set(
+            &DataKey::IssuerRotation(previous_issuer.clone()),
+            &IssuerRotationRecord {
+                previous_issuer: previous_issuer.clone(),
+                replacement_issuer: replacement_issuer.clone(),
+                rotated_at,
+                grace_expires_at,
+                grace_secs: resolved_grace,
+            },
+        );
+
+        IssuerRotated {
+            previous_issuer,
+            replacement_issuer,
+            rotated_at,
+            grace_expires_at,
+            grace_secs: resolved_grace,
+        }
+        .publish(&env);
+
+        grace_expires_at
+    }
+
+    /// Settle a lapsed issuer-rotation grace window (#323).
+    ///
+    /// Permissionless by design: the transition is fully determined by the
+    /// stored `grace_expires_at`, so any caller may close the record once the
+    /// window has lapsed, and no admin key is needed to stop a retired key from
+    /// holding standing. Callable at exactly `grace_expires_at` and after it;
+    /// the record is removed and `IssuerRotationGraceExpired` is published.
+    ///
+    /// # Reverts
+    ///
+    /// - `IssuerRotationNotFound`         if no rotation record exists
+    /// - `IssuerRotationGraceStillActive` if the window has not lapsed
+    pub fn finalize_issuer_rotation(env: Env, issuer: Address) {
+        let record: IssuerRotationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerRotation(issuer.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::IssuerRotationNotFound));
+
+        if env.ledger().timestamp() < record.grace_expires_at {
+            panic_with_error!(&env, RegistryError::IssuerRotationGraceStillActive);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::IssuerRotation(issuer.clone()));
+
+        IssuerRotationGraceExpired {
+            issuer,
+            replacement_issuer: record.replacement_issuer,
+            grace_expires_at: record.grace_expires_at,
+        }
+        .publish(&env);
+    }
+
+    /// The rotation grace record for `issuer`, when the key has rotated out and
+    /// the window has not been settled yet (#323).
+    ///
+    /// `None` for an unknown key, an active key, a revoked key, and a key whose
+    /// lapsed window was already finalized. In each of those cases
+    /// [`Self::is_issuer_verifiable`] is the read that decides standing.
+    pub fn get_issuer_rotation(env: Env, issuer: Address) -> Option<IssuerRotationRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IssuerRotation(issuer))
+    }
+
+    /// Whether `issuer` may still anchor verification of evidence it issued
+    /// (#323).
+    ///
+    /// True while the registry lists the issuer as active, and true for a
+    /// rotated-out key until its grace window lapses. False for an unknown key,
+    /// a revoked key, and a key at or past `grace_expires_at` — a lapsed window
+    /// fails closed rather than being silently extended. Never panics, so a
+    /// caller can pre-flight an unknown, revoked, or unsupported issuer without
+    /// risking a reverted transaction.
+    pub fn is_issuer_verifiable(env: Env, issuer: Address) -> bool {
+        let record: Option<IssuerRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(issuer.clone()));
+        match record {
+            None => false,
+            Some(current) if current.active => true,
+            Some(_) => {
+                let rotation: Option<IssuerRotationRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::IssuerRotation(issuer));
+                match rotation {
+                    Some(window) => env.ledger().timestamp() < window.grace_expires_at,
+                    None => false,
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1803,11 +2517,8 @@ impl HarpocratesRegistry {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER1_REGISTRATION);
         require_unique(&env, &proof_id, &video_hash);
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Nullifier(nullifier.clone()))
-        {
+        let verifier = get_active_verifier(&env);
+        if Self::has_nullifier(env.clone(), verifier.clone(), nullifier.clone()) {
             panic_with_error!(&env, RegistryError::DuplicateNullifier);
         }
 
@@ -1818,7 +2529,7 @@ impl HarpocratesRegistry {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(nullifier.clone()), &true);
+            .set(&DataKey::VerifierNullifier(verifier, nullifier.clone()), &true);
 
         let expires_at = compute_expires_at(&env);
         let record = ProofRecord {
@@ -1850,8 +2561,15 @@ impl HarpocratesRegistry {
 
         let input_len = public_inputs.len();
 
-        let record = if input_len == SILENT_WITNESS_V2_INPUT_LEN {
-            // v2 scoped nullifier path
+        let record = if input_len == SILENT_WITNESS_V2_BARE_INPUT_LEN {
+            // The bare v2 frame predates #368 and commits no circuit version, so
+            // the verifier could only infer one from the length. Rejecting it by
+            // length here means a proof cannot dodge the version commitment by
+            // omitting the trailer.
+            panic_with_error!(&env, RegistryError::CircuitVersionMismatch);
+        } else if input_len == SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN {
+            // v2 scoped nullifier path; the circuit-version envelope trailer is
+            // mandatory (#368).
             let parsed = parse_scoped_silent_witness_public_inputs(&env, &public_inputs);
             if parsed.video_hash != video_hash {
                 panic_with_error!(&env, RegistryError::InvalidPublicInputs);
@@ -1867,29 +2585,22 @@ impl HarpocratesRegistry {
                 panic_with_error!(&env, RegistryError::StaleEpoch);
             }
 
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-            {
-                panic_with_error!(&env, RegistryError::DuplicateNullifier);
-            }
-
             let verifier: Address = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Verifier)
                 .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-            if proof.is_empty() {
-                panic_with_error!(&env, RegistryError::InvalidProof);
-            }
-            if !verify_external_proof(&env, &verifier, public_inputs, proof) {
-                panic_with_error!(&env, RegistryError::InvalidProof);
-            }
+            require_verified_proof(
+                &env,
+                &verifier,
+                CIRCUIT_VERSION_SILENT_WITNESS_V2,
+                public_inputs,
+                proof,
+            );
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
             let expires_at = compute_expires_at(&env);
             save_record(
@@ -1920,29 +2631,22 @@ impl HarpocratesRegistry {
             }
             require_active_credential_root(&env, &parsed.credential_root);
 
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-            {
-                panic_with_error!(&env, RegistryError::DuplicateNullifier);
-            }
-
             let verifier: Address = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Verifier)
                 .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-            if proof.is_empty() {
-                panic_with_error!(&env, RegistryError::InvalidProof);
-            }
-            if !verify_external_proof(&env, &verifier, public_inputs, proof) {
-                panic_with_error!(&env, RegistryError::InvalidProof);
-            }
+            require_verified_proof(
+                &env,
+                &verifier,
+                CIRCUIT_VERSION_SILENT_WITNESS_V1,
+                public_inputs,
+                proof,
+            );
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
             let expires_at = compute_expires_at(&env);
             save_record(
@@ -2027,18 +2731,20 @@ impl HarpocratesRegistry {
         }
 
         // 2. Verify the aggregated UltraHonk proof through the configured
-        //    verifier contract.
+        //    verifier contract, validating the aggregation circuit version at
+        //    the trust boundary first.
         let verifier: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Verifier)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-        if proof.is_empty() {
-            panic_with_error!(&env, RegistryError::InvalidProof);
-        }
-        if !verify_external_proof(&env, &verifier, public_inputs, proof) {
-            panic_with_error!(&env, RegistryError::InvalidProof);
-        }
+        require_verified_proof(
+            &env,
+            &verifier,
+            CIRCUIT_VERSION_AGGREGATION,
+            public_inputs,
+            proof,
+        );
 
         // 3. Credential root must be registered and active.
         let shared_root = &parsed.elements[0].credential_root;
@@ -2088,16 +2794,24 @@ impl HarpocratesRegistry {
             }
 
             // Check nullifier uniqueness.
-            if env
+            let verifier: Address = env
                 .storage()
                 .persistent()
-                .has(&DataKey::Nullifier(element.nullifier.clone()))
-            {
+                .get(&DataKey::Verifier)
+                .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
+
+            if Self::has_nullifier(env.clone(), verifier.clone(), element.nullifier.clone()) {
                 panic_with_error!(&env, RegistryError::DuplicateNullifier);
             }
         }
 
         // All checks passed — persist every element.
+        let verifier: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Verifier)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
+
         for i in 0..batch_size {
             let element = &parsed.elements[i as usize];
             let video_hash = video_hashes.get(i).unwrap();
@@ -2106,7 +2820,7 @@ impl HarpocratesRegistry {
             // Consume the nullifier.
             env.storage()
                 .persistent()
-                .set(&DataKey::Nullifier(element.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier.clone(), element.nullifier.clone()), &true);
 
             let record = save_record(
                 &env,
@@ -2180,6 +2894,7 @@ impl HarpocratesRegistry {
     ) -> ProofRecord {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER3_REGISTRATION);
         issuer.require_auth();
+        require_issuer_role_available(&env, &issuer);
         require_unique(&env, &proof_id, &video_hash);
 
         let issuer_record = get_issuer_record(&env, &issuer);
@@ -2386,10 +3101,11 @@ impl HarpocratesRegistry {
     ) -> ProofRecord {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER2_REGISTRATION);
         delegate.require_auth();
-        require_delegation(&env, &source, &delegate, DELEGATION_SCOPE_REGISTER_SOURCE);
+        let delegation =
+            require_delegation(&env, &source, &delegate, DELEGATION_SCOPE_REGISTER_SOURCE);
         require_unique(&env, &proof_id, &video_hash);
 
-        let expires_at = compute_expires_at(&env);
+        let expires_at = bounded_delegated_expiry(&env, delegation.expires_at);
         let record = ProofRecord {
             video_hash,
             metadata_hash,
@@ -2429,7 +3145,8 @@ impl HarpocratesRegistry {
     ) -> ProofRecord {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER3_REGISTRATION);
         delegate.require_auth();
-        require_delegation(&env, &issuer, &delegate, DELEGATION_SCOPE_REGISTER_SEAL);
+        let delegation =
+            require_delegation(&env, &issuer, &delegate, DELEGATION_SCOPE_REGISTER_SEAL);
         require_unique(&env, &proof_id, &video_hash);
 
         let issuer_record = get_issuer_record(&env, &issuer);
@@ -2437,7 +3154,7 @@ impl HarpocratesRegistry {
             panic_with_error!(&env, RegistryError::UnknownIssuer);
         }
 
-        let expires_at = compute_expires_at(&env);
+        let expires_at = bounded_delegated_expiry(&env, delegation.expires_at);
         let record = ProofRecord {
             video_hash,
             metadata_hash,
@@ -2597,7 +3314,6 @@ impl HarpocratesRegistry {
             .unwrap_or(0)
     }
 
-
     // -----------------------------------------------------------------------
     // On-chain metadata envelope versioning (#317)
     // -----------------------------------------------------------------------
@@ -2713,11 +3429,7 @@ impl HarpocratesRegistry {
         {
             return envelope.version;
         }
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Proof(proof_id))
-        {
+        if env.storage().persistent().has(&DataKey::Proof(proof_id)) {
             return METADATA_ENVELOPE_VERSION_DEFAULT;
         }
         0
@@ -2727,7 +3439,6 @@ impl HarpocratesRegistry {
     pub fn is_supported_envelope_version(_env: Env, version: u32) -> bool {
         version >= METADATA_ENVELOPE_V1 && version <= METADATA_ENVELOPE_VERSION_MAX
     }
-
 
     pub fn get_proof(env: Env, proof_id: BytesN<32>) -> Option<ProofRecord> {
         env.storage().persistent().get(&DataKey::Proof(proof_id))
@@ -2739,24 +3450,38 @@ impl HarpocratesRegistry {
         proof_id.and_then(|id| env.storage().persistent().get(&DataKey::Proof(id)))
     }
 
-    pub fn has_nullifier(env: Env, nullifier: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Nullifier(nullifier))
+    pub fn has_nullifier(env: Env, verifier: Address, nullifier: BytesN<32>) -> bool {
+        if env.storage().persistent().has(&DataKey::VerifierNullifier(verifier, nullifier.clone())) {
+            true
+        } else {
+            env.storage().persistent().has(&DataKey::Nullifier(nullifier))
+        }
     }
 
     pub fn get_issuer(env: Env, issuer: Address) -> Option<IssuerRecord> {
         env.storage().persistent().get(&DataKey::Issuer(issuer))
     }
 
-    /// Register a verifiable derivative lineage edge and persist parent
-    /// content commitments for privacy-preserving public boundaries (#332).
+    /// Record a verifiable derivative of one or more existing artefacts, and
+    /// persist the parent content commitments for privacy-preserving public
+    /// boundaries (#332, #333).
     ///
-    /// Parent commitments are derived on-chain from each parent's stored
-    /// public fields so callers cannot supply forged bindings. Failure modes
-    /// (empty parents, unknown/revoked/expired parents, cycles, depth/fan-out
-    /// overflow, duplicate output) panic with stable `RegistryError` codes and
-    /// never log media, secrets, or witness material.
+    /// Parent commitments are derived on-chain from each parent's stored public
+    /// fields so callers cannot supply forged bindings. `depth` is the depth the
+    /// caller believes this derivative sits at: it is checked against the depth
+    /// implied by the parents rather than trusted, so a caller cannot claim a
+    /// shallow position to slip past `MAX_LINEAGE_DEPTH`; the stored record and
+    /// the published event always carry the derived depth.
+    ///
+    /// Fails with `LineageFanOutExceeded` (#60) when the parent set exceeds
+    /// `MAX_LINEAGE_FANOUT`, `LineageFanOutSaturated` (#79) when a parent
+    /// already has `MAX_LINEAGE_FANOUT` derivatives, `LineageCycle` (#58) for a
+    /// self-referential edge, `LineageTooDeep` (#59) past `MAX_LINEAGE_DEPTH`,
+    /// `LineageDepthMismatch` (#80) for a forged depth, `DuplicateLineage` (#78)
+    /// for an output digest that is already recorded, `LineageEmptyParents`
+    /// (#76) for an empty parent set, `LineageParentUnavailable` (#77) for a
+    /// revoked or expired proof parent, and `InvalidLineage` (#57) for a
+    /// duplicated or unknown parent set.
     pub fn register_lineage(
         env: Env,
         actor: Address,
@@ -2767,8 +3492,10 @@ impl HarpocratesRegistry {
         depth: u32,
     ) -> LineageRecord {
         actor.require_auth();
-        validate_lineage(&env, &parent_proof_ids, &output_digest, depth);
 
+        // A lineage record is immutable evidence. Re-registering an output
+        // digest would let any caller overwrite a recorded derivation and spend
+        // a parent's fan-out budget without producing a new derivative.
         if env
             .storage()
             .persistent()
@@ -2777,8 +3504,7 @@ impl HarpocratesRegistry {
             panic_with_error!(&env, RegistryError::DuplicateLineage);
         }
 
-        let parent_commitments =
-            collect_lineage_parent_commitments(&env, &parent_proof_ids);
+        let parent_commitments = collect_lineage_parent_commitments(&env, &parent_proof_ids);
 
         let record = LineageRecord {
             parent_proof_ids: parent_proof_ids.clone(),
@@ -2787,7 +3513,7 @@ impl HarpocratesRegistry {
             actor: actor.clone(),
             operation_type: operation_type.clone(),
             output_digest: output_digest.clone(),
-            depth,
+            depth: derived_depth,
         };
         env.storage()
             .persistent()
@@ -2798,7 +3524,7 @@ impl HarpocratesRegistry {
             manifest_digest: manifest_digest.clone(),
             actor: actor.clone(),
             operation_type: operation_type.clone(),
-            depth,
+            depth: derived_depth,
             parent_commitments,
         }
         .publish(&env);
@@ -2816,7 +3542,6 @@ impl HarpocratesRegistry {
             .persistent()
             .get(&DataKey::Lineage(output_digest))
     }
-
 
     // -----------------------------------------------------------------------
     // Independent timestamp claims (#339)
@@ -2900,8 +3625,7 @@ impl HarpocratesRegistry {
             .get::<DataKey, TimestampClaim>(&key)
         {
             // Allow only upgrades: higher assurance, or same assurance with new RFC3161.
-            let adds_rfc3161 = has_rfc3161
-                && (existing.sources & TIMESTAMP_SOURCE_RFC3161) == 0;
+            let adds_rfc3161 = has_rfc3161 && (existing.sources & TIMESTAMP_SOURCE_RFC3161) == 0;
             if assurance < existing.assurance || (assurance == existing.assurance && !adds_rfc3161)
             {
                 panic_with_error!(&env, RegistryError::TimestampClaimAlreadyAnchored);
@@ -2952,8 +3676,10 @@ impl HarpocratesRegistry {
         env: Env,
         output_digest: BytesN<32>,
     ) -> Option<soroban_sdk::Vec<BytesN<32>>> {
-        let record: Option<LineageRecord> =
-            env.storage().persistent().get(&DataKey::Lineage(output_digest));
+        let record: Option<LineageRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Lineage(output_digest));
         record.map(|r| r.parent_commitments)
     }
 
@@ -3083,29 +3809,22 @@ impl HarpocratesRegistry {
 
         require_active_credential_root(&env, &parsed.credential_root);
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-        {
-            panic_with_error!(&env, RegistryError::DuplicateNullifier);
-        }
-
         let verifier: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Verifier)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-        if proof.is_empty() {
-            panic_with_error!(&env, RegistryError::InvalidProof);
-        }
-        if !verify_external_proof(&env, &verifier, public_inputs, proof) {
-            panic_with_error!(&env, RegistryError::InvalidProof);
-        }
+        require_verified_proof(
+            &env,
+            &verifier,
+            CIRCUIT_VERSION_REVOCATION_WITNESS,
+            public_inputs,
+            proof,
+        );
 
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+            .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
         NonRevocationChecked {
             credential_root: parsed.credential_root,
@@ -3233,10 +3952,11 @@ impl HarpocratesRegistry {
     /// size and no storage is touched, so it is safe to expose publicly and
     /// safe to call while any domain is paused.
     ///
-    /// `schema_id` is [`SCHEMA_ID_SILENT_WITNESS`] or
-    /// [`SCHEMA_ID_REVOCATION_WITNESS`]. `proof_len` is the length of the proof
-    /// blob the caller intends to submit — passed as a length rather than the
-    /// blob itself so classification never transports proof material.
+    /// `schema_id` is [`SCHEMA_ID_SILENT_WITNESS`],
+    /// [`SCHEMA_ID_SILENT_WITNESS_V2`], or [`SCHEMA_ID_REVOCATION_WITNESS`].
+    /// `proof_len` is the length of the proof blob the caller intends to submit
+    /// — passed as a length rather than the blob itself so classification never
+    /// transports proof material.
     ///
     /// Returns [`verifier_inputs::ACCEPTED_CODE`] (`0`) when the material is
     /// canonical, otherwise the stable [`RejectCode::as_code`] value. This is
@@ -3256,14 +3976,22 @@ impl HarpocratesRegistry {
         // Schema dispatch precedes the length check, matching the Python and
         // TypeScript layers: an unrecognised schema is reported as such even
         // when the frame is also the wrong length.
-        if schema_id != SCHEMA_ID_SILENT_WITNESS && schema_id != SCHEMA_ID_REVOCATION_WITNESS {
+        if schema_id != SCHEMA_ID_SILENT_WITNESS
+            && schema_id != SCHEMA_ID_SILENT_WITNESS_V2
+            && schema_id != SCHEMA_ID_REVOCATION_WITNESS
+        {
             return RejectCode::UnknownSchema.as_code();
         }
 
-        // Each schema has its own frame length (silent witness 160 bytes,
-        // revocation 128 bytes), matching `verifier_inputs::classify`.
-        let expected_len: u32 = if schema_id == SCHEMA_ID_SILENT_WITNESS {
+        // Each schema has its own frame length (silent witness v1 160 bytes,
+        // the circuit-versioned v2 envelope 256 bytes, revocation 128 bytes),
+        // matching `verifier_inputs::classify`.
+        let silent_v1 = schema_id == SCHEMA_ID_SILENT_WITNESS;
+        let silent_v2 = schema_id == SCHEMA_ID_SILENT_WITNESS_V2;
+        let expected_len: u32 = if silent_v1 {
             SILENT_WITNESS_V1_INPUT_LEN
+        } else if silent_v2 {
+            verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN as u32
         } else {
             REVOCATION_PUBLIC_INPUTS_LEN as u32
         };
@@ -3271,10 +3999,18 @@ impl HarpocratesRegistry {
             return RejectCode::Length.as_code();
         }
 
-        let parsed = if schema_id == SCHEMA_ID_SILENT_WITNESS {
+        let parsed = if silent_v1 {
             let mut frame = [0u8; PUBLIC_INPUTS_LEN];
             public_inputs.copy_into_slice(&mut frame);
             verifier_inputs::parse_silent_witness(
+                &frame,
+                &verifier_inputs::SILENT_WITNESS_DOMAIN_TAG_BE,
+            )
+            .map(|_| ())
+        } else if silent_v2 {
+            let mut frame = [0u8; verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN];
+            public_inputs.copy_into_slice(&mut frame);
+            verifier_inputs::parse_silent_witness_v2(
                 &frame,
                 &verifier_inputs::SILENT_WITNESS_DOMAIN_TAG_BE,
             )
@@ -3386,29 +4122,22 @@ impl HarpocratesRegistry {
 
         require_active_credential_root(&env, &parsed.credential_root);
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-        {
-            panic_with_error!(&env, RegistryError::DuplicateNullifier);
-        }
-
         let verifier: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Verifier)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-        if proof.is_empty() {
-            panic_with_error!(&env, RegistryError::InvalidProof);
-        }
-        if !verify_external_proof(&env, &verifier, public_inputs, proof) {
-            panic_with_error!(&env, RegistryError::InvalidProof);
-        }
+        require_verified_proof(
+            &env,
+            &verifier,
+            CIRCUIT_VERSION_SELECTIVE_DISCLOSURE,
+            public_inputs,
+            proof,
+        );
 
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+            .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
         SelectiveDisclosureVerified {
             schema_hash: parsed.schema_hash,
@@ -3418,6 +4147,91 @@ impl HarpocratesRegistry {
         }
         .publish(&env);
     }
+
+    // -----------------------------------------------------------------------
+    // Paginated verifier-set inspection
+    // -----------------------------------------------------------------------
+
+    /// Return a bounded, stable page of the current verifier configuration.
+    ///
+    /// Slots are ordered: **Active → Pending → Previous**. Only non-None
+    /// slots appear in `entries`. `cursor` is a 0-based slot index; pass
+    /// `next_cursor` from the previous response to continue paging.
+    ///
+    /// # Arguments
+    ///
+    /// * `cursor` – starting slot index (0 = first populated slot). A cursor
+    ///   beyond the end of the populated list returns an empty page.
+    /// * `limit`  – maximum entries per page. Must be non-zero and at most
+    ///   `MAX_VERIFIER_LIST_LIMIT`. Returns `ListLimitExceeded` otherwise.
+    ///
+    /// # Privacy
+    ///
+    /// This is a read-only query equivalent to `get_verifier` — no private
+    /// witness values, credential secrets, nullifiers, or video hashes are
+    /// surfaced. An out-of-range cursor produces an empty page rather than a
+    /// revealing error, so a scanner cannot enumerate capacity by probing.
+    ///
+    /// # Migration / compatibility
+    ///
+    /// Additive: before any verifier is configured, returns an empty page.
+    /// Callers that only need the active verifier should use `get_verifier`.
+    pub fn list_verifiers(env: Env, cursor: u32, limit: u32) -> VerifierPage {
+        if limit == 0 || limit > MAX_VERIFIER_LIST_LIMIT {
+            panic_with_error!(&env, RegistryError::ListLimitExceeded);
+        }
+
+        // Build the ordered, flattened slot list from storage.
+        // Slots are built deterministically: Active → Pending → Previous.
+        // This avoids heap allocation of a variable-length list in no_std by
+        // using a fixed-size array of Option<VerifierEntry>.
+        let slots = collect_verifier_slots(&env);
+
+        // Count the total populated (non-None) slots across all positions.
+        let total_populated: u32 = slots.iter().filter(|s| s.is_some()).count() as u32;
+
+        let slot_len = slots.len() as u32;
+
+        // A cursor beyond the slot list always returns an empty page.
+        // This is intentional: it does not reveal the set size via an error.
+        let mut entries: SorobanVec<VerifierEntry> = SorobanVec::new(&env);
+        if cursor >= slot_len {
+            return VerifierPage {
+                entries,
+                next_cursor: None,
+                total_populated,
+            };
+        }
+
+        // Walk from `cursor` up to `limit` items, skipping None slots.
+        let mut idx = cursor;
+        let mut filled: u32 = 0;
+        while idx < slot_len && filled < limit {
+            if let Some(entry) = slots[idx as usize].clone() {
+                entries.push_back(entry);
+                filled += 1;
+            }
+            idx += 1;
+        }
+
+        // `next_cursor` is Some if there are any remaining slots (None or Some)
+        // that we have not yet reached. We only set it if there is actually
+        // a remaining populated slot; empty slots beyond are not worth paging.
+        let next_cursor = if idx < slot_len {
+            // Check whether any remaining slot is populated.
+            let has_more = slots[idx as usize..].iter().any(|s| s.is_some());
+            if has_more { Some(idx) } else { None }
+        } else {
+            None
+        };
+
+        VerifierPage {
+            entries,
+            next_cursor,
+            total_populated,
+        }
+    }
+}
 
     // -----------------------------------------------------------------------
     // Dispute / correction state machine (#dispute)
@@ -3783,7 +4597,6 @@ impl HarpocratesRegistry {
             .get(&DataKey::ProofOpenDisputeCount(proof_id))
             .unwrap_or(0u32)
     }
-}
 
 fn require_admin(env: &Env, candidate: &Address) {
     let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
@@ -3792,6 +4605,40 @@ fn require_admin(env: &Env, candidate: &Address) {
     candidate.require_auth();
     if &admin != candidate {
         panic_with_error!(env, RegistryError::Unauthorized);
+    }
+}
+
+/// Reject issuer role assignment to an address that currently holds registry
+/// administrator authority. Callers that create pending state must separately
+/// check the pending address so a proposal cannot be used to stage a conflict.
+fn require_issuer_role_available(env: &Env, issuer: &Address) {
+    let admin: Address = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::NotInitialized));
+    if issuer == &admin {
+        panic_with_error!(env, RegistryError::RoleConflict);
+    }
+}
+
+/// Reject transferring admin authority to an address with active issuer
+/// authority. Revoked issuer records remain safe to transfer into and preserve
+/// the historical metadata returned by `get_issuer`.
+fn require_admin_role_available(env: &Env, candidate: &Address) {
+    require_issuer_role_available(env, candidate);
+    let issuer_record: Option<IssuerRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Issuer(candidate.clone()));
+    if matches!(
+        issuer_record,
+        Some(IssuerRecord {
+            active: true,
+            ..
+        })
+    ) {
+        panic_with_error!(env, RegistryError::RoleConflict);
     }
 }
 
@@ -3818,6 +4665,79 @@ fn require_pauser(env: &Env, caller: &Address) -> bool {
     }
 }
 
+/// Require that `caller` may commit a receipt digest for `record`: either the
+/// registry admin (any tier) or the proof's own tier-2 source / tier-3 issuer.
+/// Tier 1 proofs carry no on-chain identity, so they are admin-only — the
+/// same precedent `respond_dispute` uses for anonymous proofs.
+///
+/// `caller.require_auth()` must already have run; this function only decides
+/// whether the (public) proof record names the caller.
+fn require_receipt_actor(env: &Env, caller: &Address, record: &ProofRecord) {
+    let admin: Address = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::NotInitialized));
+    if caller == &admin {
+        return;
+    }
+
+    let matches_subject = match record.tier {
+        TIER_CONSISTENT_SOURCE => record.source.as_ref() == Some(caller),
+        TIER_PUBLIC_SEAL => record.issuer.as_ref() == Some(caller),
+        _ => false,
+    };
+    if !matches_subject {
+        panic_with_error!(env, RegistryError::Unauthorized);
+    }
+}
+
+/// Number of currently active receipt-signing keys.
+fn receipt_signer_count(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReceiptSignerCount)
+        .unwrap_or(0u32)
+}
+
+/// Domain-separated digest a receipt signer must sign for
+/// `commit_receipt_digest` to accept a commitment.
+///
+/// Preimage layout (129 bytes, see `RECEIPT_ATTEST_PREIMAGE_LEN`):
+///
+/// ```text
+/// [  0.. 29)  RECEIPT_ATTEST_DOMAIN  "harpocrates:receipt-digest:v1"
+/// [ 29.. 65)  XDR of the calling contract's address
+///             (4-byte big-endian discriminant 1 || 32-byte contract id)
+/// [ 65.. 97)  proof_id
+/// [ 97..129)  receipt_digest
+/// ```
+///
+/// Binding the contract address keeps an attestation issued for one
+/// deployment from being replayed against another registry that happens to
+/// register the same signer key.
+fn receipt_attestation_digest(
+    env: &Env,
+    proof_id: &BytesN<32>,
+    receipt_digest: &BytesN<32>,
+) -> Hash<32> {
+    let mut preimage = Bytes::new(env);
+    preimage.extend_from_slice(&RECEIPT_ATTEST_DOMAIN);
+    // `to_xdr` serializes an Address as an ScVal: a 4-byte ScVal type tag
+    // followed by the ScAddress XDR (4-byte discriminant 1 || 32-byte
+    // contract id) that the attestation binds to. Keep only the ScAddress arm.
+    let contract_xdr = env.current_contract_address().to_xdr(env);
+    preimage.append(&contract_xdr.slice(4..40));
+    preimage.extend_from_slice(&proof_id.to_array());
+    preimage.extend_from_slice(&receipt_digest.to_array());
+
+    if preimage.len() != RECEIPT_ATTEST_PREIMAGE_LEN {
+        panic_with_error!(env, RegistryError::InvalidPublicInputs);
+    }
+
+    env.crypto().sha256(&preimage)
+}
+
 /// Reject `scope` unless it is nonzero and composed only of known
 /// `DELEGATION_SCOPE_*` bits.
 fn validate_delegation_scope(env: &Env, scope: u32) {
@@ -3840,7 +4760,17 @@ fn delegation_count(env: &Env, grantor: &Address) -> u32 {
 /// insufficiently scoped — because an operator responding to a failed
 /// registration needs to know which one happened, and none of the three
 /// discloses anything about the media or the proof.
-fn require_delegation(env: &Env, grantor: &Address, delegate: &Address, scope: u32) {
+/// Resolve the caller's live delegation and require it to carry `scope`.
+///
+/// Returns the record so the caller can also bound its own artifact by the
+/// delegation's expiry (#338). Reverts with the stable `DelegationNotFound`,
+/// `DelegationExpired`, or `DelegationScopeExceeded` code.
+fn require_delegation(
+    env: &Env,
+    grantor: &Address,
+    delegate: &Address,
+    scope: u32,
+) -> DelegationRecord {
     validate_delegation_scope(env, scope);
 
     let record: DelegationRecord = env
@@ -3855,6 +4785,25 @@ fn require_delegation(env: &Env, grantor: &Address, delegate: &Address, scope: u
 
     if record.scope & scope != scope {
         panic_with_error!(env, RegistryError::DelegationScopeExceeded);
+    }
+
+    record
+}
+
+/// Bound a delegated registration's lifetime by the delegation that authorized
+/// it (#338).
+///
+/// A non-zero proof TTL is capped at the delegation's `expires_at`; an eternal
+/// proof (TTL `0`) becomes exactly the delegation's expiry instead of `0`. The
+/// delegation has already been checked live, so the result is strictly in the
+/// future and can never be zero. Direct, non-delegated registration is
+/// untouched.
+fn bounded_delegated_expiry(env: &Env, delegation_expires_at: u64) -> u64 {
+    let ttl_expiry = compute_expires_at(env);
+    if ttl_expiry == 0 {
+        delegation_expires_at
+    } else {
+        ttl_expiry.min(delegation_expires_at)
     }
 }
 
@@ -3948,10 +4897,20 @@ fn get_issuer_record(env: &Env, issuer: &Address) -> IssuerRecord {
 }
 
 fn get_credential_root_record(env: &Env, credential_root: &BytesN<32>) -> CredentialRootRecord {
-    env.storage()
-        .persistent()
-        .get(&DataKey::CredentialRoot(credential_root.clone()))
-        .unwrap_or_else(|| panic_with_error!(env, RegistryError::UnknownCredentialRoot))
+    let key_v2 = DataKey::CredentialRootV2(credential_root.clone());
+    if let Some(record) = env.storage().persistent().get(&key_v2) {
+        return record;
+    }
+    let key_v1 = DataKey::CredentialRoot(credential_root.clone());
+    if let Some(v1) = env.storage().persistent().get::<_, CredentialRootRecordV1>(&key_v1) {
+        return CredentialRootRecord {
+            metadata_hash: v1.metadata_hash,
+            status: if v1.active { STATUS_REGISTERED } else { STATUS_REVOKED },
+            issued_at: v1.issued_at,
+            expires_at: 0,
+        };
+    }
+    panic_with_error!(env, RegistryError::UnknownCredentialRoot)
 }
 
 fn get_active_verifier(env: &Env) -> Address {
@@ -3976,10 +4935,53 @@ fn get_verifier_rotation_state(env: &Env) -> VerifierState {
         })
 }
 
+/// Build the ordered, fixed-size slot list for `list_verifiers`.
+///
+/// Returns exactly 3 entries in role order: [Active, Pending, Previous].
+/// Each entry is `None` if the corresponding slot is unpopulated.
+///
+/// The active slot is read from `DataKey::Verifier` (the canonical active
+/// address) first. If `DataKey::VerifierState` is present the pending and
+/// previous slots are taken from it. When the VerifierState carries an
+/// `active_verifier` that differs from `DataKey::Verifier` (e.g. mid-
+/// rotation) the `DataKey::Verifier` value is authoritative for the Active
+/// slot, matching the semantics of `get_verifier`.
+fn collect_verifier_slots(env: &Env) -> [Option<VerifierEntry>; 3] {
+    let active_addr: Option<Address> = env.storage().persistent().get(&DataKey::Verifier);
+
+    let state_opt: Option<VerifierState> =
+        env.storage().persistent().get(&DataKey::VerifierState);
+
+    let active_entry = active_addr.map(|addr| VerifierEntry {
+        address: addr,
+        role: VerifierRole::Active,
+    });
+
+    let (pending_entry, previous_entry) = match state_opt {
+        Some(state) => {
+            let pending = state.pending_verifier.map(|addr| VerifierEntry {
+                address: addr,
+                role: VerifierRole::Pending,
+            });
+            let previous = state.previous_verifier.map(|addr| VerifierEntry {
+                address: addr,
+                role: VerifierRole::Previous,
+            });
+            (pending, previous)
+        }
+        None => (None, None),
+    };
+
+    [active_entry, pending_entry, previous_entry]
+}
+
 fn require_active_credential_root(env: &Env, credential_root: &BytesN<32>) {
     let record = get_credential_root_record(env, credential_root);
-    if !record.active {
+    if record.status == STATUS_REVOKED {
         panic_with_error!(env, RegistryError::RevokedCredentialRoot);
+    }
+    if record.status == STATUS_EXPIRED || (record.expires_at > 0 && env.ledger().timestamp() >= record.expires_at) {
+        panic_with_error!(env, RegistryError::ExpiredCredentialRoot);
     }
 }
 
@@ -4083,7 +5085,6 @@ fn record_proof_history(
     .publish(env);
 }
 
-
 fn require_timestamp_claim_actor(env: &Env, actor: &Address, proof: &ProofRecord) {
     actor.require_auth();
 
@@ -4109,8 +5110,7 @@ fn require_timestamp_claim_actor(env: &Env, actor: &Address, proof: &ProofRecord
 }
 
 fn compute_timestamp_assurance(sources: u32) -> u32 {
-    let independent =
-        (sources & (TIMESTAMP_SOURCE_STELLAR | TIMESTAMP_SOURCE_RFC3161)) != 0;
+    let independent = (sources & (TIMESTAMP_SOURCE_STELLAR | TIMESTAMP_SOURCE_RFC3161)) != 0;
     if independent {
         return TIMESTAMP_ASSURANCE_INDEPENDENT;
     }
@@ -4126,6 +5126,31 @@ fn compute_timestamp_assurance(sources: u32) -> u32 {
 /// self-reference, and every parent must already be a usable proof or lineage
 /// record (proofs must not be revoked/expired).
 
+/// Derivatives already recorded against `parent` (#333).
+fn lineage_child_count(env: &Env, parent: &BytesN<32>) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::LineageChildCount(parent.clone()))
+        .unwrap_or(0u32)
+}
+
+/// Validate a lineage edge set and return the depth it implies (#333).
+///
+/// Every bound is checked before anything is written, so a rejected edge never
+/// leaves a parent charged for a derivative that was not recorded:
+///
+/// - The parent set is non-empty (`LineageEmptyParents`), at most
+///   `MAX_LINEAGE_FANOUT` long (in-degree), and contains no repeated digest, so
+///   the cap counts distinct edges rather than duplicate entries.
+/// - The output digest is not one of its own parents, and every parent is
+///   already a known proof or lineage record, so an edge can only ever point at
+///   evidence that exists. A proof parent must still be usable: a revoked or
+///   expired proof cannot anchor a derivative (`LineageParentUnavailable`).
+/// - The depth derived from the parents is within `MAX_LINEAGE_DEPTH` and equal
+///   to `claimed_depth`, so a caller cannot claim a shallow position to slip
+///   past the cap (`LineageDepthMismatch`).
+/// - Every parent still has out-degree budget left under `MAX_LINEAGE_FANOUT`
+///   (`LineageFanOutSaturated`).
 fn require_supported_metadata_envelope_version(env: &Env, version: u32) {
     if version < METADATA_ENVELOPE_V1 || version > METADATA_ENVELOPE_VERSION_MAX {
         panic_with_error!(env, RegistryError::UnsupportedMetadataEnvelopeVersion);
@@ -4186,42 +5211,72 @@ fn stamp_default_metadata_envelope(env: &Env, proof_id: &BytesN<32>, metadata_ha
     }
     .publish(env);
 }
-
 fn validate_lineage(
     env: &Env,
-    parent_proof_ids: &SorobanVec<BytesN<32>>,
+    parent_proof_ids: &Vec<BytesN<32>>,
     output_digest: &BytesN<32>,
-    depth: u32,
-) {
-    if parent_proof_ids.len() == 0 {
+    claimed_depth: u32,
+) -> u32 {
+    let parent_count = parent_proof_ids.len();
+
+    // A derivative with no parents is a registration, not a lineage edge.
+    if parent_count == 0 {
         panic_with_error!(env, RegistryError::LineageEmptyParents);
     }
-    if parent_proof_ids.len() > MAX_LINEAGE_FANOUT as u32 {
+    if parent_count > MAX_LINEAGE_FANOUT {
         panic_with_error!(env, RegistryError::LineageFanOutExceeded);
     }
-    if depth > MAX_LINEAGE_DEPTH {
-        panic_with_error!(env, RegistryError::LineageTooDeep);
-    }
-    if depth == 0 {
-        panic_with_error!(env, RegistryError::InvalidLineage);
-    }
 
-    for parent in parent_proof_ids.iter() {
+    let mut max_parent_depth: u32 = 0;
+    for cursor in 0..parent_count {
+        let parent = parent_proof_ids.get(cursor).unwrap();
+
         if parent == *output_digest {
             panic_with_error!(env, RegistryError::LineageCycle);
         }
-        if env.storage().persistent().has(&DataKey::Proof(parent.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Proof(parent.clone()))
+        {
             let status = HarpocratesRegistry::get_proof_status(env.clone(), parent.clone());
             if status != ProofVerificationStatus::Valid {
                 panic_with_error!(env, RegistryError::LineageParentUnavailable);
             }
             continue;
         }
-        if env.storage().persistent().has(&DataKey::Lineage(parent.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Lineage(parent.clone()))
+        {
             continue;
         }
         panic_with_error!(env, RegistryError::InvalidLineage);
     }
+
+    let derived_depth = max_parent_depth.saturating_add(1);
+    if derived_depth > MAX_LINEAGE_DEPTH {
+        panic_with_error!(env, RegistryError::LineageTooDeep);
+    }
+    if claimed_depth != derived_depth {
+        panic_with_error!(env, RegistryError::LineageDepthMismatch);
+    }
+
+    // Charge every parent's out-degree budget. Budgets are read before any is
+    // written so a saturated parent cannot leave the earlier parents charged.
+    for parent in parent_proof_ids.iter() {
+        if lineage_child_count(env, &parent) >= MAX_LINEAGE_FANOUT {
+            panic_with_error!(env, RegistryError::LineageFanOutSaturated);
+        }
+    }
+    for parent in parent_proof_ids.iter() {
+        let key = DataKey::LineageChildCount(parent.clone());
+        let used = lineage_child_count(env, &parent);
+        env.storage().persistent().set(&key, &(used + 1));
+    }
+
+    derived_depth
 }
 
 /// Derive the domain-separated parent content commitment (#332).
@@ -4273,9 +5328,48 @@ fn collect_lineage_parent_commitments(
             ));
             continue;
         }
-        panic_with_error!(env, RegistryError::InvalidLineage);
+        if check_lineage_cycle(env, &parent, output_digest) {
+            panic_with_error!(env, RegistryError::LineageCycle);
+        }
     }
-    commitments
+}
+
+fn check_lineage_cycle(env: &Env, proof_id: &BytesN<32>, target: &BytesN<32>) -> bool {
+    let mut visited = SorobanVec::new(env);
+    check_lineage_cycle_internal(env, proof_id, target, &mut visited, 1)
+}
+
+fn check_lineage_cycle_internal(
+    env: &Env,
+    proof_id: &BytesN<32>,
+    target: &BytesN<32>,
+    visited: &mut SorobanVec<BytesN<32>>,
+    depth: u32,
+) -> bool {
+    if depth > MAX_LINEAGE_DEPTH {
+        return false;
+    }
+
+    if visited.iter().any(|v| v == *proof_id) {
+        return false;
+    }
+    visited.push_back(proof_id.clone());
+
+    if *proof_id == *target {
+        return true;
+    }
+
+    let lineage_key = DataKey::Lineage(proof_id.clone());
+    if env.storage().persistent().has(&lineage_key) {
+        let lineage: LineageRecord = env.storage().persistent().get(&lineage_key).unwrap();
+        for parent in lineage.parent_proof_ids.iter() {
+            if check_lineage_cycle_internal(env, &parent, target, visited, depth + 1) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Derive the deterministic sub-proof_id for batch element `index`.
@@ -4376,27 +5470,33 @@ struct ScopedSilentWitnessInputs {
     domain_tag: BytesN<32>,
 }
 
-/// Parse the 224-byte public-input blob produced by the v2 scoped
-/// silent_witness Noir circuit.
+/// Parse the public-input blob produced by the v2 scoped silent_witness Noir
+/// circuit: the 256-byte envelope carrying the circuit-version trailer (#368).
 ///
-/// Layout (7 x BN254 field elements, 32 bytes each):
-///   [  0.. 32)  video_hash_hi + video_hash_lo (packed)
-///   [ 32.. 64)  video_hash_lo continued
-///   [ 64.. 96)  credential_root
-///   [ 96..128)  nullifier
-///   [128..160)  verifier_scope
-///   [160..192)  epoch
-///   [192..224)  domain_tag
+/// The envelope appends a 32-byte `circuit_version` field that the producing
+/// circuit asserted in-circuit, so the proof names its own circuit; it must
+/// decode to [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`] or the registration
+/// is rejected with [`RegistryError::CircuitVersionMismatch`]. The superseded
+/// bare 224-byte frame is rejected at the dispatch in
+/// [`HarpocratesRegistry::register_anonymous_verified`] before this parser runs,
+/// so no proof can skip the version commitment.
 fn parse_scoped_silent_witness_public_inputs(
     env: &Env,
     public_inputs: &Bytes,
 ) -> ScopedSilentWitnessInputs {
-    if public_inputs.len() != SILENT_WITNESS_V2_INPUT_LEN {
+    let input_len = public_inputs.len();
+    if input_len != SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN {
         panic_with_error!(env, RegistryError::InvalidPublicInputs);
     }
 
-    let mut bytes = [0u8; 224];
+    let mut bytes = [0u8; verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN];
     public_inputs.copy_into_slice(&mut bytes);
+
+    let mut trailer = [0u8; verifier_inputs::FIELD_LEN];
+    trailer.copy_from_slice(&bytes[CIRCUIT_VERSION_TRAILER_OFFSET..]);
+    if verifier_inputs::circuit_version_of(&trailer) != verifier_inputs::EXPECTED_CIRCUIT_VERSION {
+        panic_with_error!(env, RegistryError::CircuitVersionMismatch);
+    }
 
     // Reassemble video_hash: hi occupies bytes 16..32 of the first field word,
     // lo occupies bytes 48..64 of the second field word (UltraHonk packs 128-bit
@@ -4473,6 +5573,73 @@ fn verify_external_proof(
     ) {
         Ok(Ok(_)) => true,
         _ => false,
+    }
+}
+
+/// The active verifier's declared circuit-version window, defaulting to the
+/// full built-in range so an undeclared window preserves pre-#343 behaviour.
+fn get_verifier_circuit_versions_raw(env: &Env) -> (u32, u32) {
+    match env
+        .storage()
+        .persistent()
+        .get::<DataKey, VerifierCircuitVersions>(&DataKey::VerifierCircuitVersions)
+    {
+        Some(record) => (record.min_version, record.max_version),
+        None => (MIN_SUPPORTED_CIRCUIT_VERSION, MAX_SUPPORTED_CIRCUIT_VERSION),
+    }
+}
+
+/// Validate `circuit_version` against both authorities: this wasm build's own
+/// framable range and the configured verifier's declared window.
+///
+/// Fails closed with the stable `UnsupportedCircuitVersion` code, and is always
+/// called before the external verifier so an unsupported version never leaves
+/// the contract.
+fn require_supported_circuit_version(env: &Env, circuit_version: u32) {
+    if circuit_version < MIN_SUPPORTED_CIRCUIT_VERSION
+        || circuit_version > MAX_SUPPORTED_CIRCUIT_VERSION
+    {
+        panic_with_error!(env, RegistryError::UnsupportedCircuitVersion);
+    }
+
+    let (min_version, max_version) = get_verifier_circuit_versions_raw(env);
+    if circuit_version < min_version || circuit_version > max_version {
+        panic_with_error!(env, RegistryError::UnsupportedCircuitVersion);
+    }
+}
+
+/// Enforce the active verifier's verdict, gated on the verifier's declared
+/// circuit-version window (#343).
+///
+/// `circuit_version` is the version implied by the caller's frame layout (or,
+/// for selective disclosure, carried in the frame). It is validated at the
+/// trust boundary *before* the verifier is invoked, so an unsupported version
+/// fails closed with the stable `UnsupportedCircuitVersion` code instead of
+/// reaching a dependency that cannot answer it.
+///
+/// The verdict itself fails closed with the stable `InvalidProof` code when the
+/// active verifier rejects the proof or the call itself fails (dependency
+/// failure). Only the active verifier decides: once a rotation is activated the
+/// replacement is enforced immediately, so a proof minted for the outgoing
+/// circuit is not carried across the swap.
+///
+/// Every verified entry point funnels through here so the trust boundary
+/// behaves identically.
+fn require_verified_proof(
+    env: &Env,
+    active: &Address,
+    circuit_version: u32,
+    public_inputs: Bytes,
+    proof: Bytes,
+) {
+    require_supported_circuit_version(env, circuit_version);
+
+    if proof.is_empty() {
+        panic_with_error!(env, RegistryError::InvalidProof);
+    }
+
+    if !verify_external_proof(env, active, public_inputs, proof) {
+        panic_with_error!(env, RegistryError::InvalidProof);
     }
 }
 
@@ -4794,6 +5961,11 @@ fn dispatch_timelocked_action(env: &Env, proposal: &TimelockProposal) {
             env.storage()
                 .persistent()
                 .set(&DataKey::Issuer(proposal.target.clone()), &record);
+            // A timelocked revocation clears any rotation grace record too: the
+            // two retirements must never contradict each other (#323).
+            env.storage()
+                .persistent()
+                .remove(&DataKey::IssuerRotation(proposal.target.clone()));
             IssuerRevoked {
                 issuer: proposal.target.clone(),
             }
@@ -4813,12 +5985,25 @@ fn dispatch_timelocked_action(env: &Env, proposal: &TimelockProposal) {
         }
         4 => {
             let mut record = get_credential_root_record(env, &proposal.payload);
-            record.active = false;
+            record.status = STATUS_REVOKED;
             env.storage()
                 .persistent()
-                .set(&DataKey::CredentialRoot(proposal.payload.clone()), &record);
+                .set(&DataKey::CredentialRootV2(proposal.payload.clone()), &record);
             CredentialRootRevoked {
                 credential_root: proposal.payload.clone(),
+            }
+            .publish(env);
+        }
+        5 => {
+            let mut record = get_credential_root_record(env, &proposal.payload);
+            record.status = STATUS_EXPIRED;
+            record.expires_at = env.ledger().timestamp();
+            env.storage()
+                .persistent()
+                .set(&DataKey::CredentialRootV2(proposal.payload.clone()), &record);
+            CredentialRootExpired {
+                credential_root: proposal.payload.clone(),
+                expired_at: record.expires_at,
             }
             .publish(env);
         }
@@ -4984,6 +6169,14 @@ mod test_identity_tier_properties;
 #[cfg(test)]
 mod test_invariants;
 #[cfg(test)]
+mod test_issuer_rotation;
+#[cfg(test)]
+mod test_lineage;
+#[cfg(test)]
+mod test_metadata_envelope;
+#[cfg(test)]
+mod test_invariants;
+#[cfg(test)]
 mod test_pause;
 #[cfg(test)]
 mod test_registration_replay;
@@ -5000,10 +6193,11 @@ mod test_state_machine;
 #[cfg(test)]
 pub mod test_timelock;
 #[cfg(test)]
-mod test_upgrade_compat;
-#[cfg(test)]
 mod test_timestamp_claim;
 #[cfg(test)]
-mod test_lineage;
+mod test_selective_disclosure;
 #[cfg(test)]
-mod test_metadata_envelope;
+mod test_list_verifiers;
+mod test_upgrade_compat;
+#[cfg(test)]
+mod test_verifier_versions;
